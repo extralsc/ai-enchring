@@ -25,7 +25,7 @@ from datasets import Dataset
 from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm
-from transformers import CLIPProcessor, CLIPModel, pipeline
+from transformers import AutoModel, AutoProcessor, pipeline
 from sentence_transformers import SentenceTransformer
 
 # Configure logging
@@ -57,7 +57,8 @@ class Config:
     num_workers: int = 8  # For DataLoader
 
     # Models
-    clip_model: str = "openai/clip-vit-base-patch32"
+    # Fashion-specific model - 57% better than generic CLIP for clothing
+    fashion_model: str = "Marqo/marqo-fashionSigLIP"
     # Multilingual model for Swedish categories + English queries
     sentence_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     zero_shot_model: str = "facebook/bart-large-mnli"
@@ -203,20 +204,25 @@ class FastImageDownloader:
 
 
 # =============================================================================
-# CLIP PROCESSOR - Optimized for speed
+# FASHION IMAGE PROCESSOR - Using Marqo FashionSigLIP
 # =============================================================================
 
-class FastCLIPProcessor:
-    """CLIP processor optimized for maximum throughput."""
+class FashionImageProcessor:
+    """Fashion-specific image processor using Marqo FashionSigLIP model.
+
+    57% better recall than generic CLIP for fashion/clothing detection.
+    Trained specifically on fashion colors, categories, materials, and styles.
+    """
 
     def __init__(self, config: Config):
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"CLIP using device: {self.device}")
+        logger.info(f"FashionSigLIP using device: {self.device}")
 
-        # Load model
-        self.model = CLIPModel.from_pretrained(config.clip_model)
-        self.processor = CLIPProcessor.from_pretrained(config.clip_model, use_fast=True)
+        # Load fashion-specific model
+        logger.info(f"Loading {config.fashion_model}...")
+        self.model = AutoModel.from_pretrained(config.fashion_model, trust_remote_code=True)
+        self.processor = AutoProcessor.from_pretrained(config.fashion_model, trust_remote_code=True)
 
         # Optimize for speed
         self.model = self.model.to(self.device)
@@ -224,35 +230,29 @@ class FastCLIPProcessor:
             self.model = self.model.half()
         self.model.eval()
 
-        # Compile model for faster inference (PyTorch 2.0+)
-        if hasattr(torch, 'compile'):
-            try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                logger.info("CLIP model compiled with torch.compile()")
-            except:
-                pass
-
-        # Pre-compute text embeddings
+        # Pre-compute text embeddings for colors and categories
         self._precompute_embeddings()
 
     @torch.no_grad()
     def _precompute_embeddings(self):
-        """Pre-compute all text embeddings once."""
-        color_texts = [f"a photo of {c} colored clothing" for c in self.config.color_prompts]
-        color_inputs = self.processor(text=color_texts, return_tensors="pt", padding=True)
-        color_inputs = {k: v.to(self.device) for k, v in color_inputs.items()}
-        self.color_embeddings = self.model.get_text_features(**color_inputs)
-        self.color_embeddings = self.color_embeddings / self.color_embeddings.norm(dim=-1, keepdim=True)
+        """Pre-compute all text embeddings once for fast inference."""
+        # Color prompts - fashion-specific phrasing
+        color_texts = [f"{c} colored clothing" for c in self.config.color_prompts]
+        color_inputs = self.processor(text=color_texts, padding='max_length', return_tensors="pt")
+        color_input_ids = color_inputs['input_ids'].to(self.device)
+        self.color_embeddings = self.model.get_text_features(color_input_ids, normalize=True)
         if self.config.use_fp16:
             self.color_embeddings = self.color_embeddings.half()
 
-        category_texts = [f"a photo of a {c}" for c in self.config.category_prompts]
-        category_inputs = self.processor(text=category_texts, return_tensors="pt", padding=True)
-        category_inputs = {k: v.to(self.device) for k, v in category_inputs.items()}
-        self.category_embeddings = self.model.get_text_features(**category_inputs)
-        self.category_embeddings = self.category_embeddings / self.category_embeddings.norm(dim=-1, keepdim=True)
+        # Category prompts - fashion-specific phrasing
+        category_texts = [f"a {c}" for c in self.config.category_prompts]
+        category_inputs = self.processor(text=category_texts, padding='max_length', return_tensors="pt")
+        category_input_ids = category_inputs['input_ids'].to(self.device)
+        self.category_embeddings = self.model.get_text_features(category_input_ids, normalize=True)
         if self.config.use_fp16:
             self.category_embeddings = self.category_embeddings.half()
+
+        logger.info(f"Pre-computed embeddings for {len(self.config.color_prompts)} colors, {len(self.config.category_prompts)} categories")
 
     @torch.no_grad()
     def process_batch(self, images: list[Image.Image]) -> list[dict]:
@@ -268,17 +268,17 @@ class FastCLIPProcessor:
             return [{"color": None, "category": None, "color_conf": 0, "category_conf": 0} for _ in images]
 
         # Process images
-        inputs = self.processor(images=valid_images, return_tensors="pt", padding=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        image_features = self.model.get_image_features(**inputs)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        inputs = self.processor(images=valid_images, return_tensors="pt")
+        pixel_values = inputs['pixel_values'].to(self.device)
         if self.config.use_fp16:
-            image_features = image_features.half()
+            pixel_values = pixel_values.half()
 
-        # Compute similarities
-        color_sims = (image_features @ self.color_embeddings.T).softmax(dim=-1)
-        category_sims = (image_features @ self.category_embeddings.T).softmax(dim=-1)
+        # Get image features (normalized)
+        image_features = self.model.get_image_features(pixel_values, normalize=True)
+
+        # Compute similarities (scale by 100 as per FashionSigLIP convention)
+        color_sims = (100.0 * image_features @ self.color_embeddings.T).softmax(dim=-1)
+        category_sims = (100.0 * image_features @ self.category_embeddings.T).softmax(dim=-1)
 
         color_probs, color_idx = color_sims.max(dim=-1)
         category_probs, category_idx = category_sims.max(dim=-1)
@@ -436,10 +436,11 @@ class TaxonomyMapper:
         ]
 
     def map_batch_categories(self, detected: list[str], product_types: list[str],
-                              google_categories: list[str] = None, detected_confidences: list[float] = None) -> list[dict]:
+                              google_categories: list[str] = None, detected_confidences: list[float] = None,
+                              titles: list[str] = None) -> list[dict]:
         """
         Map batch of categories to local taxonomy.
-        Priority: product_type (specific) > detected from image (if confident) > google_category (often generic/empty)
+        Priority: product_type > title keywords > detected from image (if confident) > google_category
         """
         if not self.local_categories:
             return [{"id": None, "name": None, "confidence": 0.0} for _ in detected]
@@ -448,24 +449,38 @@ class TaxonomyMapper:
             google_categories = [''] * len(detected)
         if detected_confidences is None:
             detected_confidences = [1.0] * len(detected)
+        if titles is None:
+            titles = [''] * len(detected)
 
-        # Minimum confidence to use CLIP detection (0.02 is basically random!)
+        # Minimum confidence to use image detection
         MIN_DETECTION_CONFIDENCE = 0.15
 
-        # Build query with priority: product_type > detected (if confident) > google (fallback only)
+        # Build query with priority: product_type > title > detected (if confident) > google
         queries = []
-        for d, p, g, conf in zip(detected, product_types, google_categories, detected_confidences):
+        for d, p, g, conf, title in zip(detected, product_types, google_categories, detected_confidences, titles):
             parts = []
 
             # 1. Product type is usually most specific (e.g., "Half zip sweater", "Jacket", "T-shirt")
             if p:
                 parts.append(p)
 
-            # 2. Detected from image - ONLY if confidence is above threshold
+            # 2. Title often contains product keywords (e.g., "M's Tree Message Tee" → "Tee")
+            if title:
+                # Extract last word which often indicates product type
+                title_words = title.split()
+                if title_words:
+                    # Common product keywords at end of title
+                    last_word = title_words[-1].rstrip(',').lower()
+                    product_keywords = ['jacket', 'coat', 'tee', 't-shirt', 'shirt', 'pants', 'jeans',
+                                       'shorts', 'dress', 'skirt', 'sweater', 'hoodie', 'top', 'blouse']
+                    if last_word in product_keywords:
+                        parts.append(last_word)
+
+            # 3. Detected from image - ONLY if confidence is above threshold
             if d and conf >= MIN_DETECTION_CONFIDENCE:
                 parts.append(d)
 
-            # 3. Google category - only use last segment if specific enough
+            # 4. Google category - only use last segment if specific enough
             if g and '>' in g:
                 last_segment = g.split('>')[-1].strip()
                 # Skip if too generic
@@ -497,6 +512,39 @@ class TaxonomyMapper:
 
         return [
             {"id": self.local_genders[idx.item()]["id"], "name": self.local_genders[idx.item()]["name"], "confidence": round(score.item(), 3)}
+            for idx, score in zip(best_idx, best_scores)
+        ]
+
+    def nlp_classify_categories(self, titles: list[str], descriptions: list[str],
+                                 product_types: list[str]) -> list[dict]:
+        """
+        BETA: NLP-based category classification using text only (no images).
+        Uses title, description, and product_type to match against local categories.
+        """
+        if not self.local_categories:
+            return [{"id": None, "name": None, "confidence": 0.0} for _ in titles]
+
+        # Build rich text queries from all available text fields
+        queries = []
+        for title, desc, ptype in zip(titles, descriptions, product_types):
+            parts = []
+            if ptype:
+                parts.append(ptype)
+            if title:
+                parts.append(title)
+            if desc:
+                # Take first 100 chars of description
+                parts.append(desc[:100])
+            queries.append(' '.join(parts) if parts else 'unknown')
+
+        # Encode and match
+        query_emb = self.model.encode(queries, convert_to_tensor=True, show_progress_bar=False)
+        sims = torch.nn.functional.cosine_similarity(query_emb.unsqueeze(1), self.category_embeddings.unsqueeze(0), dim=2)
+        best_idx = sims.argmax(dim=1)
+        best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+
+        return [
+            {"id": self.local_categories[idx.item()]["id"], "name": self.local_categories[idx.item()]["name"], "confidence": round(score.item(), 3)}
             for idx, score in zip(best_idx, best_scores)
         ]
 
@@ -600,8 +648,8 @@ class ProductEnrichmentPipeline:
         logger.info(f"Loaded {len(colors)} colors, {len(categories)} categories, {len(genders)} genders")
 
         # Initialize models
-        logger.info("Loading CLIP model...")
-        self.clip = FastCLIPProcessor(self.config)
+        logger.info("Loading FashionSigLIP model...")
+        self.fashion = FashionImageProcessor(self.config)
 
         logger.info("Loading Sentence Transformer...")
         self.mapper = TaxonomyMapper(self.config)
@@ -645,7 +693,7 @@ class ProductEnrichmentPipeline:
         images = await downloader.download_batch(urls)
 
         # CLIP inference
-        clip_results = self.clip.process_batch(images)
+        clip_results = self.fashion.process_batch(images)
 
         return clip_results
 
@@ -672,6 +720,8 @@ class ProductEnrichmentPipeline:
             csv_genders = [p.get('gender', '') for p in products]
             product_types = [p.get('product_type', '') for p in products]
             google_categories = [p.get('google_product_category', '') for p in products]
+            titles = [p.get('title', '') for p in products]
+            descriptions = [p.get('description', '') for p in products]
 
             # Build rich context for size classification (uses ALL available signals)
             size_contexts = [
@@ -730,9 +780,13 @@ class ProductEnrichmentPipeline:
                 detected_colors, csv_colors, detected_color_confidences
             )
             mapped_categories = self.mapper.map_batch_categories(
-                detected_categories, product_types, google_categories, detected_category_confidences
+                detected_categories, product_types, google_categories, detected_category_confidences, titles
             )
             mapped_genders = self.mapper.map_batch_genders(csv_genders)
+
+            # BETA: NLP-based category classification (text only, no images)
+            logger.info("Running NLP category classification (beta)...")
+            nlp_categories = self.mapper.nlp_classify_categories(titles, descriptions, product_types)
 
             # Enrich products
             logger.info("Enriching products...")
@@ -759,6 +813,11 @@ class ProductEnrichmentPipeline:
                 product['mapped_local_gender_id'] = mapped_genders[i]["id"]
                 product['mapped_local_gender'] = mapped_genders[i]["name"]
                 product['gender_mapping_confidence'] = mapped_genders[i]["confidence"]
+
+                # BETA: NLP-based category (text only, no images)
+                product['beta_nlp_category_id'] = nlp_categories[i]["id"]
+                product['beta_nlp_category'] = nlp_categories[i]["name"]
+                product['beta_nlp_category_confidence'] = nlp_categories[i]["confidence"]
 
             # Write output
             self.write_csv(products, output_path)
