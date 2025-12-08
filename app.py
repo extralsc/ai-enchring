@@ -25,7 +25,8 @@ from datasets import Dataset
 from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoModel, AutoProcessor, pipeline
+import open_clip
+from transformers import pipeline
 from sentence_transformers import SentenceTransformer
 
 # Configure logging
@@ -219,10 +220,12 @@ class FashionImageProcessor:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"FashionSigLIP using device: {self.device}")
 
-        # Load fashion-specific model
+        # Load fashion-specific model using open_clip
         logger.info(f"Loading {config.fashion_model}...")
-        self.model = AutoModel.from_pretrained(config.fashion_model, trust_remote_code=True)
-        self.processor = AutoProcessor.from_pretrained(config.fashion_model, trust_remote_code=True)
+        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+            f'hf-hub:{config.fashion_model}'
+        )
+        self.tokenizer = open_clip.get_tokenizer(f'hf-hub:{config.fashion_model}')
 
         # Optimize for speed
         self.model = self.model.to(self.device)
@@ -238,17 +241,15 @@ class FashionImageProcessor:
         """Pre-compute all text embeddings once for fast inference."""
         # Color prompts - fashion-specific phrasing
         color_texts = [f"{c} colored clothing" for c in self.config.color_prompts]
-        color_inputs = self.processor(text=color_texts, padding='max_length', return_tensors="pt")
-        color_input_ids = color_inputs['input_ids'].to(self.device)
-        self.color_embeddings = self.model.get_text_features(color_input_ids, normalize=True)
+        color_tokens = self.tokenizer(color_texts).to(self.device)
+        self.color_embeddings = self.model.encode_text(color_tokens, normalize=True)
         if self.config.use_fp16:
             self.color_embeddings = self.color_embeddings.half()
 
         # Category prompts - fashion-specific phrasing
         category_texts = [f"a {c}" for c in self.config.category_prompts]
-        category_inputs = self.processor(text=category_texts, padding='max_length', return_tensors="pt")
-        category_input_ids = category_inputs['input_ids'].to(self.device)
-        self.category_embeddings = self.model.get_text_features(category_input_ids, normalize=True)
+        category_tokens = self.tokenizer(category_texts).to(self.device)
+        self.category_embeddings = self.model.encode_text(category_tokens, normalize=True)
         if self.config.use_fp16:
             self.category_embeddings = self.category_embeddings.half()
 
@@ -267,14 +268,13 @@ class FashionImageProcessor:
         if not valid_images:
             return [{"color": None, "category": None, "color_conf": 0, "category_conf": 0} for _ in images]
 
-        # Process images
-        inputs = self.processor(images=valid_images, return_tensors="pt")
-        pixel_values = inputs['pixel_values'].to(self.device)
+        # Preprocess and stack images
+        processed_images = torch.stack([self.preprocess(img) for img in valid_images]).to(self.device)
         if self.config.use_fp16:
-            pixel_values = pixel_values.half()
+            processed_images = processed_images.half()
 
         # Get image features (normalized)
-        image_features = self.model.get_image_features(pixel_values, normalize=True)
+        image_features = self.model.encode_image(processed_images, normalize=True)
 
         # Compute similarities (scale by 100 as per FashionSigLIP convention)
         color_sims = (100.0 * image_features @ self.color_embeddings.T).softmax(dim=-1)
