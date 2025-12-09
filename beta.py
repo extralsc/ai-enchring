@@ -72,12 +72,21 @@ class Config:
 class CategoryCache:
     """Cache kategorier lokalt för att slippa DB-anrop varje gång."""
 
+    # Gender mapping: CSV gender value -> database gender_id
+    # Uppdatera dessa baserat på din product_gender tabell
+    GENDER_MAP = {
+        'male': 1,      # Herr
+        'female': 7,    # Dam
+        'unisex': None,  # Matcha mot alla
+    }
+
     def __init__(self, cache_file: Path = CACHE_DIR / "categories.json"):
         self.cache_file = cache_file
         self.categories = []
         self.by_level = {}  # {level: [categories]}
         self.by_parent = {}  # {parent_id: [categories]}
         self.by_id = {}  # {id: category}
+        self.by_level_gender = {}  # {(level, gender_id): [categories]}
 
     def load_from_cache(self) -> bool:
         """Ladda från lokal cache om den finns."""
@@ -122,11 +131,13 @@ class CategoryCache:
         self.by_level = {}
         self.by_parent = {}
         self.by_id = {}
+        self.by_level_gender = {}
 
         for cat in self.categories:
             cat_id = cat['id']
             level = cat.get('level', 1)
             parent_id = cat.get('parent_id')
+            gender_id = cat.get('gender_id')
 
             self.by_id[cat_id] = cat
 
@@ -134,13 +145,23 @@ class CategoryCache:
                 self.by_level[level] = []
             self.by_level[level].append(cat)
 
+            # Index by level + gender
+            key = (level, gender_id)
+            if key not in self.by_level_gender:
+                self.by_level_gender[key] = []
+            self.by_level_gender[key].append(cat)
+
             if parent_id is not None:
                 if parent_id not in self.by_parent:
                     self.by_parent[parent_id] = []
                 self.by_parent[parent_id].append(cat)
 
-    def get_level(self, level: int) -> list[dict]:
-        """Hämta alla kategorier på en viss nivå."""
+    def get_level(self, level: int, gender: str = None) -> list[dict]:
+        """Hämta kategorier på en viss nivå, eventuellt filtrerat på gender."""
+        if gender and gender.lower() in self.GENDER_MAP:
+            gender_id = self.GENDER_MAP[gender.lower()]
+            if gender_id is not None:
+                return self.by_level_gender.get((level, gender_id), [])
         return self.by_level.get(level, [])
 
     def get_children(self, parent_id: int) -> list[dict]:
@@ -150,6 +171,12 @@ class CategoryCache:
     def get_by_id(self, cat_id: int) -> Optional[dict]:
         """Hämta kategori via ID."""
         return self.by_id.get(cat_id)
+
+    def get_gender_id(self, gender: str) -> Optional[int]:
+        """Konvertera CSV gender till database gender_id."""
+        if gender and gender.lower() in self.GENDER_MAP:
+            return self.GENDER_MAP[gender.lower()]
+        return None
 
 
 # =============================================================================
@@ -220,13 +247,27 @@ class EmbeddingModel:
 
         return torch.cat(all_emb, dim=0)
 
-    def get_category_embeddings(self, categories: list[dict], cache_key: str) -> tuple[torch.Tensor, list[dict]]:
+    def get_category_embeddings(self, categories: list[dict], cache_key: str,
+                                   category_cache: 'CategoryCache' = None) -> tuple[torch.Tensor, list[dict]]:
         """Hämta/skapa embeddings för kategorier (med cache)."""
         if cache_key in self.category_embeddings_cache:
             return self.category_embeddings_cache[cache_key]
 
-        # Använd bara 'name' för embedding (inte path)
-        names = [cat['name'] for cat in categories]
+        # För Level 1: berika med barn-kategorier för bättre matching
+        if cache_key == "level_1" and category_cache:
+            names = []
+            for cat in categories:
+                children = category_cache.get_children(cat['id'])
+                if children:
+                    child_names = [c['name'] for c in children[:8]]  # Max 8 barn
+                    enriched = f"{cat['name']}: {', '.join(child_names)}"
+                    names.append(enriched)
+                else:
+                    names.append(cat['name'])
+            logger.info(f"Level 1 berikade kategorier: {names[:3]}...")
+        else:
+            names = [cat['name'] for cat in categories]
+
         embeddings = self.encode(names, prefix="passage: ")
 
         self.category_embeddings_cache[cache_key] = (embeddings, categories)
@@ -250,21 +291,32 @@ class HierarchicalClassifier:
         self.model = embedding_model
         self.max_levels = 4
 
-    def _build_product_text(self, product: dict) -> str:
+    def _build_product_text(self, product: dict, level: int = 1) -> str:
         """Bygg produkttext för embedding."""
         product_type = product.get('product_type', '') or ''
         title = product.get('title', '') or ''
         description = (product.get('description', '') or '')[:300]
 
-        parts = []
-        if product_type:
-            parts.append(product_type)
-        if title:
-            parts.append(title)
-        if description:
-            parts.append(description)
-
-        return ' | '.join(parts) if parts else 'unknown'
+        if level == 1:
+            # Level 1: Fokusera på product_type (mest pålitlig signal)
+            # Repetera product_type för extra vikt, skippa description (har brus)
+            parts = []
+            if product_type:
+                parts.append(product_type)
+                parts.append(product_type)  # Dubbel vikt
+            if title:
+                parts.append(title)
+            return ' | '.join(parts) if parts else 'unknown'
+        else:
+            # Level 2+: Använd allt för finare matching
+            parts = []
+            if product_type:
+                parts.append(product_type)
+            if title:
+                parts.append(title)
+            if description:
+                parts.append(description)
+            return ' | '.join(parts) if parts else 'unknown'
 
     def _match_to_categories(self, product_embeddings: torch.Tensor, categories: list[dict],
                              cat_embeddings: torch.Tensor) -> list[tuple[dict, float]]:
@@ -284,10 +336,6 @@ class HierarchicalClassifier:
 
     def classify_batch(self, products: list[dict]) -> list[dict]:
         """Klassificera en batch hierarkiskt."""
-        # Skapa produkt-embeddings
-        texts = [self._build_product_text(p) for p in products]
-        product_emb = self.model.encode(texts, prefix="query: ")
-
         # Resultat för varje produkt
         results = [{
             'level_1': None, 'level_1_id': None, 'level_1_conf': 0.0,
@@ -296,22 +344,48 @@ class HierarchicalClassifier:
             'level_4': None, 'level_4_id': None, 'level_4_conf': 0.0,
         } for _ in products]
 
-        # === LEVEL 1 ===
-        level1_cats = self.cache.get_level(1)
-        if not level1_cats:
-            logger.warning("Inga Level 1 kategorier hittades!")
-            return results
+        # === LEVEL 1 med gender-filtrering ===
+        # Gruppera produkter efter gender
+        gender_groups = {}
+        for i, p in enumerate(products):
+            gender = (p.get('gender', '') or '').lower()
+            if gender not in gender_groups:
+                gender_groups[gender] = []
+            gender_groups[gender].append(i)
 
-        l1_emb, l1_cats = self.model.get_category_embeddings(level1_cats, "level_1")
-        l1_matches = self._match_to_categories(product_emb, l1_cats, l1_emb)
+        # Skapa embeddings för Level 1 (alla produkter)
+        texts_l1 = [self._build_product_text(p, level=1) for p in products]
+        product_emb_l1 = self.model.encode(texts_l1, prefix="query: ")
 
-        for i, (cat, conf) in enumerate(l1_matches):
-            if cat and conf >= self.config.min_confidence:
-                results[i]['level_1'] = cat['name']
-                results[i]['level_1_id'] = cat['id']
-                results[i]['level_1_conf'] = round(conf, 4)
+        # Matcha varje gender-grupp mot sina kategorier
+        for gender, indices in gender_groups.items():
+            level1_cats = self.cache.get_level(1, gender if gender else None)
+            if not level1_cats:
+                # Fallback till alla kategorier om gender inte hittas
+                level1_cats = self.cache.get_level(1)
+            if not level1_cats:
+                continue
+
+            # Berika Level 1 kategorier med barn-namn
+            cache_key = f"level_1_gender_{gender}" if gender else "level_1"
+            l1_emb, l1_cats = self.model.get_category_embeddings(level1_cats, cache_key, self.cache)
+
+            # Hämta embeddings för denna gender-grupp
+            group_emb = product_emb_l1[indices]
+            l1_matches = self._match_to_categories(group_emb, l1_cats, l1_emb)
+
+            for j, (cat, conf) in enumerate(l1_matches):
+                idx = indices[j]
+                if cat and conf >= self.config.min_confidence:
+                    results[idx]['level_1'] = cat['name']
+                    results[idx]['level_1_id'] = cat['id']
+                    results[idx]['level_1_conf'] = round(conf, 4)
 
         # === LEVEL 2, 3, 4 ===
+        # För djupare nivåer: använd full produkttext (inkl. description)
+        texts_full = [self._build_product_text(p, level=2) for p in products]
+        product_emb_full = self.model.encode(texts_full, prefix="query: ")
+
         for level in [2, 3, 4]:
             prev_level = level - 1
             prev_key = f'level_{prev_level}_id'
@@ -336,7 +410,7 @@ class HierarchicalClassifier:
                 child_emb, child_cats = self.model.get_category_embeddings(children, cache_key)
 
                 # Hämta produkt-embeddings för denna grupp
-                group_emb = product_emb[indices]
+                group_emb = product_emb_full[indices]
 
                 # Matcha
                 matches = self._match_to_categories(group_emb, child_cats, child_emb)
