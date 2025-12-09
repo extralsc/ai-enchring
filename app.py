@@ -1155,18 +1155,8 @@ class TaxonomyMapper:
                             parts.append(self.ENGLISH_TO_SWEDISH[last_word])
 
             # 4. SKIP image detection - unreliable (wrong images from suppliers)
-            # Only use text-based signals: product_type, description, title, google_category
-
-            # 5. Google category - only use last segment if specific enough
-            if g and '>' in g:
-                last_segment = g.split('>')[-1].strip()
-                # Skip if too generic
-                if last_segment and last_segment.lower() not in ['clothing', 'apparel', 'accessories', 'other']:
-                    parts.append(last_segment)
-                    # Add Swedish translation
-                    seg_lower = last_segment.lower()
-                    if seg_lower in self.ENGLISH_TO_SWEDISH:
-                        parts.append(self.ENGLISH_TO_SWEDISH[seg_lower])
+            # 5. SKIP Google category - often WRONG (e.g., "Jackets" for pants)
+            # Only use: product_type, description, title
 
             # Build final query and enrich with dictionary
             query = ' '.join(parts) if parts else 'unknown'
