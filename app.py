@@ -29,6 +29,7 @@ from tqdm import tqdm
 import open_clip
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer
+from transformers import MarianMTModel, MarianTokenizer
 
 # Configure logging
 logging.basicConfig(
@@ -66,6 +67,15 @@ class Config:
     # Sentence similarity is FAST but less accurate
     # Set to False for ~3x faster processing
     use_zeroshot_category: bool = False  # Disable slow zero-shot, use sentence similarity
+
+    # Neural translation - translates descriptions to English for better understanding
+    # Handles 70+ suppliers with different languages
+    use_neural_translation: bool = True  # Enable for multi-language support
+
+    # LLM-based category matching - uses a local LLM for accurate understanding
+    # Much more accurate but slower than embedding matching
+    use_llm_category: bool = True  # Enable for best accuracy
+    llm_model: str = "Qwen/Qwen2.5-7B-Instruct"  # Excellent multilingual LLM (~14GB) - understands Swedish well
 
     # Models - OPTIMIZED for A10's 24GB VRAM
     # FashionSigLIP outperforms FashionCLIP on fashion benchmarks
@@ -173,6 +183,140 @@ class Config:
         if self.db_url:
             return self.db_url
         return ""
+
+
+# =============================================================================
+# NEURAL MACHINE TRANSLATION - For any language → English
+# =============================================================================
+
+class NeuralTranslator:
+    """Neural machine translation for multi-language support.
+
+    Uses Helsinki-NLP MarianMT models to translate ANY language to English.
+    This handles the 70+ suppliers with different languages/terminology.
+    """
+
+    def __init__(self):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.models = {}  # Cache loaded models
+        self.tokenizers = {}
+
+    def _load_model(self, src_lang: str):
+        """Lazy load translation model for source language."""
+        if src_lang in self.models:
+            return
+
+        # Map common language codes to Helsinki-NLP model names
+        model_map = {
+            'sv': 'Helsinki-NLP/opus-mt-sv-en',  # Swedish
+            'de': 'Helsinki-NLP/opus-mt-de-en',  # German
+            'fr': 'Helsinki-NLP/opus-mt-fr-en',  # French
+            'es': 'Helsinki-NLP/opus-mt-es-en',  # Spanish
+            'it': 'Helsinki-NLP/opus-mt-it-en',  # Italian
+            'nl': 'Helsinki-NLP/opus-mt-nl-en',  # Dutch
+            'da': 'Helsinki-NLP/opus-mt-da-en',  # Danish
+            'no': 'Helsinki-NLP/opus-mt-no-en',  # Norwegian
+            'fi': 'Helsinki-NLP/opus-mt-fi-en',  # Finnish
+            'pl': 'Helsinki-NLP/opus-mt-pl-en',  # Polish
+            'mul': 'Helsinki-NLP/opus-mt-mul-en', # Multilingual fallback
+        }
+
+        model_name = model_map.get(src_lang, model_map['mul'])
+
+        try:
+            logger.info(f"Loading translation model: {model_name}")
+            self.tokenizers[src_lang] = MarianTokenizer.from_pretrained(model_name)
+            self.models[src_lang] = MarianMTModel.from_pretrained(model_name).to(self.device)
+            if self.device == "cuda":
+                self.models[src_lang] = self.models[src_lang].half()
+            logger.info(f"Translation model loaded: {src_lang} → English")
+        except Exception as e:
+            logger.warning(f"Failed to load {model_name}: {e}, falling back to multilingual")
+            if src_lang != 'mul':
+                self._load_model('mul')
+                self.models[src_lang] = self.models['mul']
+                self.tokenizers[src_lang] = self.tokenizers['mul']
+
+    def translate_batch(self, texts: list[str], src_lang: str = 'sv') -> list[str]:
+        """Translate batch of texts from source language to English."""
+        if not texts:
+            return []
+
+        self._load_model(src_lang)
+
+        if src_lang not in self.models:
+            logger.warning(f"No model for {src_lang}, returning original texts")
+            return texts
+
+        model = self.models[src_lang]
+        tokenizer = self.tokenizers[src_lang]
+
+        # Batch translate
+        translated = []
+        batch_size = 32  # Smaller batches for translation
+
+        with torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                # Truncate long texts
+                batch = [t[:500] if t else "" for t in batch]
+
+                inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                outputs = model.generate(**inputs, max_length=512)
+                decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+                translated.extend(decoded)
+
+        return translated
+
+    def detect_and_translate(self, text: str) -> tuple[str, str]:
+        """Detect language and translate to English if needed.
+
+        Returns: (translated_text, detected_language)
+        """
+        if not text:
+            return "", "unknown"
+
+        # Simple language detection based on common words
+        text_lower = text.lower()
+
+        # Swedish indicators
+        swedish_words = ['och', 'för', 'med', 'som', 'är', 'att', 'av', 'på', 'den', 'det', 'i', 'till']
+        # German indicators
+        german_words = ['und', 'für', 'mit', 'ist', 'das', 'die', 'der', 'ein', 'eine', 'zu']
+        # French indicators
+        french_words = ['et', 'pour', 'avec', 'est', 'le', 'la', 'les', 'un', 'une', 'de']
+
+        words = text_lower.split()
+
+        swedish_count = sum(1 for w in words if w in swedish_words)
+        german_count = sum(1 for w in words if w in german_words)
+        french_count = sum(1 for w in words if w in french_words)
+
+        if swedish_count > german_count and swedish_count > french_count and swedish_count > 1:
+            lang = 'sv'
+        elif german_count > swedish_count and german_count > french_count and german_count > 1:
+            lang = 'de'
+        elif french_count > swedish_count and french_count > german_count and french_count > 1:
+            lang = 'fr'
+        else:
+            # Assume English or use multilingual
+            return text, 'en'
+
+        translated = self.translate_batch([text], lang)[0]
+        return translated, lang
+
+
+# Global translator instance (lazy loaded)
+_translator = None
+
+def get_translator() -> NeuralTranslator:
+    """Get or create the global translator instance."""
+    global _translator
+    if _translator is None:
+        _translator = NeuralTranslator()
+    return _translator
 
 
 # =============================================================================
@@ -650,6 +794,36 @@ class TaxonomyMapper:
         'nattlinne': 'nightgown nightdress',
         'morgonrock': 'robe bathrobe',
 
+        # Base layers / Thermal underwear
+        'underställ': 'base layer thermal underwear long underwear baselayer merino',
+        'undertröja': 'thermal top base layer top long sleeve underwear',
+        'underbyxa': 'thermal pants base layer pants long underwear bottoms',
+        'långkalsonger': 'long johns thermal pants base layer',
+        'merinoull': 'merino wool thermal base layer',
+        'baslager': 'base layer thermal underwear',
+
+        # Outdoor / Ski wear / Shell clothing
+        'skalbyxor': 'shell pants ski pants waterproof pants outdoor pants skiing trousers hardshell',
+        'skaljacka': 'shell jacket ski jacket waterproof jacket outdoor jacket hardshell',
+        'skalplagg': 'shell garment waterproof outdoor hardshell',
+        'skidbyxor': 'ski pants skiing pants snow pants winter pants',
+        'skidjacka': 'ski jacket skiing jacket snow jacket winter jacket',
+        'skidkläder': 'ski wear skiing clothes ski clothing winter sports',
+        'friluftsbyxor': 'outdoor pants hiking pants trekking pants',
+        'friluftsjacka': 'outdoor jacket hiking jacket trekking jacket',
+        'vandringsjacka': 'hiking jacket trekking jacket outdoor jacket',
+        'vandringsbyxor': 'hiking pants trekking pants outdoor pants',
+        'regnbyxor': 'rain pants waterproof pants',
+        'vindbyxor': 'wind pants windproof pants',
+        'softshellbyxor': 'softshell pants outdoor pants hiking pants',
+        'hardshell': 'hardshell waterproof shell outdoor skiing',
+        'gore-tex': 'gore-tex waterproof breathable outdoor',
+        'vattentät': 'waterproof water-resistant',
+        'andningsförmåga': 'breathable breathability',
+        'freeride': 'freeride skiing backcountry',
+        'topptur': 'ski touring backcountry skiing alpine touring',
+        'alpin': 'alpine skiing downhill',
+
         # General
         'kläder': 'clothing apparel clothes',
         'herr': 'men mens male man',
@@ -728,6 +902,28 @@ class TaxonomyMapper:
         'crew': 'sweatshirt tröja',
         'half zip': 'halv dragkedja',
         'running': 'löpar löpning',
+        'base layer': 'underställ baslager',
+        'thermal': 'underställ termisk',
+        'long underwear': 'underställ långkalsonger',
+        'merino': 'merinoull merino',
+        'baselayer': 'underställ baslager',
+        # Outdoor / Ski wear
+        'shell pants': 'skalbyxor skidbyxor',
+        'ski pants': 'skidbyxor skalbyxor',
+        'snow pants': 'skidbyxor vinterbyxor',
+        'shell jacket': 'skaljacka skidjacka',
+        'ski jacket': 'skidjacka skaljacka',
+        'outdoor pants': 'friluftsbyxor vandringsbyxor',
+        'hiking pants': 'vandringsbyxor friluftsbyxor',
+        'rain pants': 'regnbyxor',
+        'waterproof': 'vattentät vattenavvisande',
+        'breathable': 'andningsbar',
+        'hardshell': 'hardshell skalplagg',
+        'softshell': 'softshell',
+        'freeride': 'freeride offpist',
+        'alpine': 'alpin',
+        'bib pants': 'hängselbyxor skalbyxor',
+        'bib': 'hängslen hängselbyxor',
     }
 
     # Gender term mappings (common variations → database values)
@@ -755,6 +951,9 @@ class TaxonomyMapper:
         # Load bilingual dictionary for word-level translations
         self.dictionary = get_dictionary()
         self.dictionary.load()
+
+        # Load neural translator for any language → English
+        self.translator = get_translator()
 
     def _add_bilingual_aliases(self, text: str) -> str:
         """Add translations in both directions (Swedish↔English) for better matching.
@@ -882,10 +1081,10 @@ class TaxonomyMapper:
 
     def map_batch_categories(self, detected: list[str], product_types: list[str],
                               google_categories: list[str] = None, detected_confidences: list[float] = None,
-                              titles: list[str] = None) -> list[dict]:
+                              titles: list[str] = None, descriptions: list[str] = None) -> list[dict]:
         """
         Map batch of categories to local taxonomy.
-        Priority: product_type > title keywords > detected from image (if confident) > google_category
+        Priority: product_type > description keywords > title keywords > detected from image > google_category
 
         Returns dict with: id, name, confidence, suggested_category
         - If confidence >= threshold: returns matched local category, suggested_category = None
@@ -900,25 +1099,44 @@ class TaxonomyMapper:
             detected_confidences = [1.0] * len(detected)
         if titles is None:
             titles = [''] * len(detected)
+        if descriptions is None:
+            descriptions = [''] * len(detected)
 
         # Minimum confidence to use image detection
         MIN_DETECTION_CONFIDENCE = 0.15
 
-        # Build query with priority: product_type > title > detected (if confident) > google
+        # Build query with priority: product_type > description keywords > title > detected > google
         queries = []
-        for d, p, g, conf, title in zip(detected, product_types, google_categories, detected_confidences, titles):
+        for d, p, g, conf, title, desc in zip(detected, product_types, google_categories, detected_confidences, titles, descriptions):
             parts = []
 
             # 1. Product type is usually most specific (e.g., "Half zip sweater", "Jacket", "T-shirt")
             if p:
                 parts.append(p)
-                # Add English aliases to help matching (e.g., "Tights" → "athletic tights leggings")
                 p_lower = p.lower()
+                # Add English aliases for Swedish terms (e.g., "Tröja" → "sweater")
                 for keyword, aliases in self.SWEDISH_TO_ENGLISH.items():
                     if keyword in p_lower:
                         parts.append(aliases)
+                # Add Swedish aliases for English terms (e.g., "Dress" → "klänning")
+                for keyword, aliases in self.ENGLISH_TO_SWEDISH.items():
+                    if keyword in p_lower:
+                        parts.append(aliases)
 
-            # 2. Title often contains product keywords (e.g., "M's Tree Message Tee" → "Tee")
+            # 2. Description often contains key category info (e.g., "underställ", "klänning")
+            if desc:
+                desc_lower = desc.lower()
+                # Look for category keywords in description
+                for keyword, aliases in self.SWEDISH_TO_ENGLISH.items():
+                    if keyword in desc_lower:
+                        parts.append(keyword)  # Add Swedish term
+                        parts.append(aliases)  # Add English translations
+                for keyword, aliases in self.ENGLISH_TO_SWEDISH.items():
+                    if keyword in desc_lower:
+                        parts.append(keyword)
+                        parts.append(aliases)
+
+            # 3. Title often contains product keywords (e.g., "M's Tree Message Tee" → "Tee")
             if title:
                 # Extract last word which often indicates product type
                 title_words = title.split()
@@ -926,22 +1144,36 @@ class TaxonomyMapper:
                     # Common product keywords at end of title
                     last_word = title_words[-1].rstrip(',').lower()
                     product_keywords = ['jacket', 'coat', 'tee', 't-shirt', 'shirt', 'pants', 'jeans',
-                                       'shorts', 'dress', 'skirt', 'sweater', 'hoodie', 'top', 'blouse']
+                                       'shorts', 'dress', 'skirt', 'sweater', 'hoodie', 'top', 'blouse',
+                                       'crew', 'fleece', 'vest', 'cardigan', 'polo']
                     if last_word in product_keywords:
                         parts.append(last_word)
+                        # Also add translations for the keyword
+                        if last_word in self.ENGLISH_TO_SWEDISH:
+                            parts.append(self.ENGLISH_TO_SWEDISH[last_word])
 
-            # 3. Detected from image - ONLY if confidence is above threshold
+            # 4. Detected from image - ONLY if confidence is above threshold
             if d and conf >= MIN_DETECTION_CONFIDENCE:
                 parts.append(d)
+                # Add Swedish translation for detected category
+                if d.lower() in self.ENGLISH_TO_SWEDISH:
+                    parts.append(self.ENGLISH_TO_SWEDISH[d.lower()])
 
-            # 4. Google category - only use last segment if specific enough
+            # 5. Google category - only use last segment if specific enough
             if g and '>' in g:
                 last_segment = g.split('>')[-1].strip()
                 # Skip if too generic
                 if last_segment and last_segment.lower() not in ['clothing', 'apparel', 'accessories', 'other']:
                     parts.append(last_segment)
+                    # Add Swedish translation
+                    seg_lower = last_segment.lower()
+                    if seg_lower in self.ENGLISH_TO_SWEDISH:
+                        parts.append(self.ENGLISH_TO_SWEDISH[seg_lower])
 
-            queries.append(' '.join(parts) if parts else 'unknown')
+            # Build final query and enrich with dictionary
+            query = ' '.join(parts) if parts else 'unknown'
+            query = self._add_bilingual_aliases(query)
+            queries.append(query)
 
         # Process in batches to avoid GPU OOM (N products x 830 categories = huge!)
         BATCH_SIZE = 256
@@ -1233,11 +1465,229 @@ class CategoryClassifier:
 
 
 # =============================================================================
+# LLM CATEGORY CLASSIFIER - Uses local LLM for accurate understanding
+# =============================================================================
+
+class LLMCategoryClassifier:
+    """Uses a local LLM to understand products and match to categories.
+
+    This solves the problem of embedding similarity not understanding semantic meaning.
+    The LLM reads the product info and determines the best category match.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = None
+        self.tokenizer = None
+        self.local_categories = []
+        self.category_list_str = ""
+
+    def load_model(self):
+        """Load the LLM model."""
+        if self.model is not None:
+            return
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        logger.info(f"Loading LLM: {self.config.llm_model}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.llm_model,
+            trust_remote_code=True
+        )
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.config.llm_model,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        logger.info("LLM loaded successfully")
+
+    def set_categories(self, categories: list[dict]):
+        """Set available categories from database."""
+        self.local_categories = categories
+        # Build a concise category list for the prompt
+        # Group by parent for clarity
+        cat_names = sorted(set(c["name"] for c in categories))
+        self.category_list_str = ", ".join(cat_names[:100])  # Top 100 for prompt length
+        logger.info(f"LLM Classifier: {len(cat_names)} categories available")
+
+    def classify_batch(self, contexts: list[dict]) -> list[dict]:
+        """
+        Use LLM to classify products into categories.
+
+        For each product, the LLM:
+        1. Reads title, description, product_type
+        2. Understands what the product IS
+        3. Matches to best local category OR suggests a new one
+        """
+        if not self.config.use_llm_category:
+            return [{"id": None, "name": None, "confidence": 0.0, "suggested_category": None} for _ in contexts]
+
+        self.load_model()
+
+        results = []
+        batch_size = 8  # Small batch for LLM
+
+        # Build category lookup
+        cat_lookup = {c["name"].lower(): c for c in self.local_categories}
+
+        for i in range(0, len(contexts), batch_size):
+            batch = contexts[i:i + batch_size]
+
+            for ctx in batch:
+                prompt = self._build_prompt(ctx)
+
+                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=100,
+                        temperature=0.1,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+
+                response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                # Extract the answer after the prompt
+                answer = response[len(prompt):].strip()
+
+                # Parse the LLM response
+                result = self._parse_response(answer, cat_lookup, ctx)
+                results.append(result)
+
+        return results
+
+    def _build_prompt(self, ctx: dict) -> str:
+        """Build prompt for LLM category classification."""
+        product_type = ctx.get('product_type', '')
+        title = ctx.get('title', '')
+        description = ctx.get('description', '')[:300]
+
+        prompt = f"""You are a product categorization expert. Given a product, determine the best category.
+
+Product Information:
+- Type: {product_type}
+- Title: {title}
+- Description: {description}
+
+Available Categories: {self.category_list_str}
+
+Instructions:
+1. Understand what this product is (e.g., ski pants, dress, base layer, etc.)
+2. Find the BEST matching category from the list
+3. If no good match exists, suggest a new category name
+
+Respond in this exact format:
+CATEGORY: [category name]
+CONFIDENCE: [high/medium/low]
+SUGGESTION: [new category name if no good match, otherwise "none"]
+
+Response:"""
+        return prompt
+
+    def _parse_response(self, answer: str, cat_lookup: dict, ctx: dict) -> dict:
+        """Parse LLM response into structured result."""
+        lines = answer.strip().split('\n')
+
+        category_name = None
+        confidence = 0.5
+        suggestion = None
+
+        for line in lines:
+            line = line.strip()
+            if line.startswith('CATEGORY:'):
+                category_name = line.replace('CATEGORY:', '').strip()
+            elif line.startswith('CONFIDENCE:'):
+                conf_str = line.replace('CONFIDENCE:', '').strip().lower()
+                if 'high' in conf_str:
+                    confidence = 0.9
+                elif 'medium' in conf_str:
+                    confidence = 0.7
+                else:
+                    confidence = 0.4
+            elif line.startswith('SUGGESTION:'):
+                sugg = line.replace('SUGGESTION:', '').strip()
+                if sugg.lower() != 'none':
+                    suggestion = sugg
+
+        # Find matching category
+        cat_info = cat_lookup.get(category_name.lower() if category_name else '', {})
+
+        if cat_info and confidence >= 0.5:
+            return {
+                "id": cat_info.get("id"),
+                "name": cat_info.get("name"),
+                "confidence": confidence,
+                "suggested_category": None
+            }
+        else:
+            return {
+                "id": None,
+                "name": "unknown",
+                "confidence": confidence,
+                "suggested_category": suggestion or ctx.get('product_type')
+            }
+
+
+# =============================================================================
 # SIZE TYPE CLASSIFIER - Runs in parallel
 # =============================================================================
 
 class SizeTypeClassifier:
-    """Zero-shot classifier for size type - uses all available context."""
+    """Zero-shot classifier for size type and product understanding."""
+
+    # High-level product type labels for NLP understanding
+    PRODUCT_TYPE_LABELS = [
+        # Outerwear
+        "ski jacket / shell jacket / ski wear",
+        "ski pants / shell pants / snow pants",
+        "rain jacket / waterproof jacket",
+        "winter jacket / down jacket / puffer",
+        "fleece jacket / fleece sweater",
+        "softshell jacket",
+        "windbreaker",
+        # Tops
+        "t-shirt / tee",
+        "long sleeve shirt / dress shirt",
+        "sweater / pullover / knit",
+        "hoodie / sweatshirt",
+        "polo shirt",
+        "tank top / singlet",
+        "blouse",
+        "base layer top / thermal top",
+        # Bottoms
+        "jeans / denim pants",
+        "casual pants / chinos",
+        "sweatpants / joggers",
+        "shorts",
+        "hiking pants / outdoor pants",
+        "leggings / tights",
+        "base layer pants / thermal pants",
+        # Dresses & Skirts
+        "dress",
+        "skirt",
+        # Underwear & Socks
+        "underwear / briefs / boxers",
+        "bra / sports bra",
+        "socks",
+        "base layer / thermal underwear set",
+        # Footwear
+        "sneakers / athletic shoes",
+        "boots / hiking boots",
+        "sandals",
+        "dress shoes",
+        # Accessories
+        "hat / beanie / cap",
+        "gloves / mittens",
+        "scarf",
+        "belt",
+        "bag / backpack",
+        # Swimwear
+        "swimwear / bikini / swim trunks",
+    ]
 
     def __init__(self, config: Config):
         self.config = config
@@ -1259,6 +1709,56 @@ class SizeTypeClassifier:
                 logger.info("Zero-shot model compiled with torch.compile() for faster inference")
             except Exception as e:
                 logger.warning(f"torch.compile() failed (will use uncompiled): {e}")
+
+    def understand_products(self, contexts: list[dict]) -> list[dict]:
+        """
+        Use NLP to understand what each product actually IS.
+        Returns high-level product type understanding with confidence.
+
+        This helps with cases like:
+        - "Skalbyxor" → "ski pants / shell pants"
+        - "Underställ" → "base layer / thermal underwear"
+        - "Klänning" → "dress"
+        """
+        texts = []
+        for ctx in contexts:
+            parts = []
+            if ctx.get('product_type'):
+                parts.append(f"Product: {ctx['product_type']}")
+            if ctx.get('title'):
+                parts.append(f"Title: {ctx['title']}")
+            if ctx.get('description'):
+                parts.append(f"Description: {ctx['description'][:200]}")
+            texts.append(' '.join(parts) if parts else 'unknown product')
+
+        if not texts:
+            return [{"product_type_nlp": None, "nlp_confidence": 0.0} for _ in contexts]
+
+        # Run zero-shot classification
+        logger.info(f"NLP understanding {len(texts)} products...")
+        results_list = list(self.classifier(
+            texts,
+            self.PRODUCT_TYPE_LABELS,
+            batch_size=self.config.bart_batch_size,
+            multi_label=False
+        ))
+
+        results = []
+        for out in results_list:
+            if isinstance(out, dict):
+                results.append({
+                    "product_type_nlp": out["labels"][0],
+                    "nlp_confidence": round(out["scores"][0], 3)
+                })
+            elif isinstance(out, list) and len(out) > 0:
+                results.append({
+                    "product_type_nlp": out[0].get("label", out[0].get("labels", ["unknown"])[0]),
+                    "nlp_confidence": round(out[0].get("score", out[0].get("scores", [0.0])[0]), 3)
+                })
+            else:
+                results.append({"product_type_nlp": None, "nlp_confidence": 0.0})
+
+        return results
 
     def classify_all(self, contexts: list[dict]) -> list[dict]:
         """
@@ -1371,6 +1871,13 @@ class ProductEnrichmentPipeline:
         logger.info("Setting up Category classifier (zero-shot)...")
         self.category_classifier = CategoryClassifier(self.config, self.size_classifier.classifier)
         self.category_classifier.set_categories(categories)
+
+        # LLM-based category classifier (optional, for best accuracy)
+        self.llm_classifier = None
+        if self.config.use_llm_category:
+            logger.info("Setting up LLM Category classifier...")
+            self.llm_classifier = LLMCategoryClassifier(self.config)
+            self.llm_classifier.set_categories(categories)
 
         logger.info("All models loaded!")
 
@@ -1515,9 +2022,16 @@ class ProductEnrichmentPipeline:
                 detected_colors, csv_colors, detected_color_confidences
             )
             mapped_categories = self.mapper.map_batch_categories(
-                detected_categories, product_types, google_categories, detected_category_confidences, titles
+                detected_categories, product_types, google_categories, detected_category_confidences, titles, descriptions
             )
             mapped_genders = self.mapper.map_batch_genders(csv_genders)
+
+            # LLM-based category classification (most accurate)
+            llm_categories = None
+            if self.config.use_llm_category and self.llm_classifier:
+                logger.info("Running LLM category classification...")
+                llm_categories = self.llm_classifier.classify_batch(size_contexts)
+                logger.info("LLM classification complete!")
 
             # Enrich products
             logger.info("Enriching products...")
@@ -1540,6 +2054,26 @@ class ProductEnrichmentPipeline:
                 product['category_mapping_confidence'] = mapped_categories[i]["confidence"]
                 # AI-suggested category when no good local match exists
                 product['suggested_category_name'] = mapped_categories[i].get("suggested_category")
+
+                # LLM-based category (most accurate - uses NLU to understand product)
+                if llm_categories:
+                    product['llm_category_id'] = llm_categories[i]["id"]
+                    product['llm_category'] = llm_categories[i]["name"]
+                    product['llm_category_confidence'] = llm_categories[i]["confidence"]
+                    product['llm_suggested_category'] = llm_categories[i].get("suggested_category")
+                    # Use LLM as primary if enabled and has result
+                    if llm_categories[i]["id"]:
+                        product['best_category_id'] = llm_categories[i]["id"]
+                        product['best_category'] = llm_categories[i]["name"]
+                        product['best_category_source'] = "llm"
+                    else:
+                        product['best_category_id'] = mapped_categories[i]["id"]
+                        product['best_category'] = mapped_categories[i]["name"]
+                        product['best_category_source'] = "embedding"
+                else:
+                    product['best_category_id'] = mapped_categories[i]["id"]
+                    product['best_category'] = mapped_categories[i]["name"]
+                    product['best_category_source'] = "embedding"
 
                 # Size type
                 product['size_type'] = size_results[i]["size_type"]
