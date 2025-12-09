@@ -77,7 +77,7 @@ class Config:
     use_llm_category: bool = True  # Enable for best accuracy
     llm_model: str = "Qwen/Qwen2.5-3B-Instruct"  # Good multilingual LLM
     use_vllm: bool = True  # Use vLLM for faster, stable inference
-    llm_confidence_threshold: float = 0.75  # Only use LLM if embedding confidence < this (saves time)
+    llm_confidence_threshold: float = 0.90  # Only use LLM if embedding confidence < this (saves time)
 
     # Models - OPTIMIZED for A10's 24GB VRAM
     # FashionSigLIP outperforms FashionCLIP on fashion benchmarks
