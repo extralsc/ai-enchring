@@ -75,7 +75,7 @@ class Config:
     # LLM-based category matching - uses a local LLM for accurate understanding
     # Much more accurate but slower than embedding matching
     use_llm_category: bool = True  # Enable for best accuracy
-    llm_model: str = "Qwen/Qwen2.5-3B-Instruct"  # Fast multilingual LLM (~6GB) - good Swedish understanding
+    llm_model: str = "microsoft/Phi-3-mini-4k-instruct"  # Stable, fast LLM (~4GB) - good multilingual
     llm_confidence_threshold: float = 0.75  # Only use LLM if embedding confidence < this (saves time)
 
     # Models - OPTIMIZED for A10's 24GB VRAM
