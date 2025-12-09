@@ -596,17 +596,24 @@ class CategoryClassifier:
         self.category_map = {}  # label -> {id, name, path}
 
     def set_categories(self, categories: list[dict]):
-        """Set available categories from database."""
+        """Set available categories from database.
+
+        Only use level 2-3 categories to keep label count manageable.
+        830 labels is too slow for zero-shot classification.
+        """
+        # Filter to level 2-3 categories only (main categories, not too deep)
+        filtered = [cat for cat in categories if cat.get('level', 99) in [2, 3]]
+
         # Group by name to avoid duplicates, prefer higher level (more general)
         seen_names = {}
-        for cat in categories:
+        for cat in filtered:
             name = cat['name']
             if name not in seen_names or cat.get('level', 99) < seen_names[name].get('level', 99):
                 seen_names[name] = cat
 
         self.category_map = {cat['name']: cat for cat in seen_names.values()}
         self.category_labels = list(self.category_map.keys())
-        logger.info(f"CategoryClassifier loaded {len(self.category_labels)} unique category labels")
+        logger.info(f"CategoryClassifier loaded {len(self.category_labels)} category labels (level 2-3 only, was 830)")
 
     def classify_batch(self, contexts: list[dict]) -> list[dict]:
         """
@@ -628,46 +635,43 @@ class CategoryClassifier:
                 parts.append(ctx['description'][:150])
             texts.append(' '.join(parts) if parts else 'unknown product')
 
-        # Classify in batches - use config batch size
+        # Use Dataset for efficient GPU batching (fixes sequential warning)
+        from datasets import Dataset as HFDataset
+
+        dataset = HFDataset.from_dict({"text": texts})
+
+        # Run classification on full dataset
+        logger.info(f"Classifying {len(texts)} products into {len(self.category_labels)} categories...")
+        outputs = []
+        for out in tqdm(
+            self.classifier(dataset["text"], self.category_labels, batch_size=self.config.bart_batch_size),
+            total=len(texts),
+            desc="Classifying categories",
+            leave=False
+        ):
+            outputs.append(out)
+
+        # Build results
         results = []
-        batch_size = self.config.bart_batch_size
+        for i, out in enumerate(outputs):
+            best_label = out['labels'][0]
+            best_score = out['scores'][0]
 
-        for i in tqdm(range(0, len(texts), batch_size), desc="Classifying categories", leave=False):
-            batch_texts = texts[i:i+batch_size]
-            batch_contexts = contexts[i:i+batch_size]
+            cat_info = self.category_map.get(best_label, {})
 
-            # Run classification
-            outputs = self.classifier(
-                batch_texts,
-                self.category_labels,
-                multi_label=False,
-                batch_size=batch_size
-            )
+            # If confidence too low, suggest creating a new category
+            suggestion = None
+            if best_score < self.config.min_mapping_confidence:
+                ptype = contexts[i].get('product_type', '')
+                if ptype:
+                    suggestion = ptype
 
-            # Handle single result vs list
-            if isinstance(outputs, dict):
-                outputs = [outputs]
-
-            for j, out in enumerate(outputs):
-                best_label = out['labels'][0]
-                best_score = out['scores'][0]
-
-                cat_info = self.category_map.get(best_label, {})
-
-                # If confidence too low, suggest creating a new category
-                suggestion = None
-                if best_score < self.config.min_mapping_confidence:
-                    # Generate suggestion from product_type
-                    ptype = batch_contexts[j].get('product_type', '')
-                    if ptype:
-                        suggestion = ptype
-
-                results.append({
-                    "id": cat_info.get('id') if best_score >= self.config.min_mapping_confidence else None,
-                    "name": best_label if best_score >= self.config.min_mapping_confidence else "unknown",
-                    "confidence": round(best_score, 3),
-                    "suggestion": suggestion
-                })
+            results.append({
+                "id": cat_info.get('id') if best_score >= self.config.min_mapping_confidence else None,
+                "name": best_label if best_score >= self.config.min_mapping_confidence else "unknown",
+                "confidence": round(best_score, 3),
+                "suggestion": suggestion
+            })
 
         return results
 
@@ -722,10 +726,14 @@ class SizeTypeClassifier:
         if not valid_texts:
             return [{"size_type": None, "confidence": 0.0} for _ in contexts]
 
+        # Use Dataset for efficient GPU batching (fixes sequential warning)
+        from datasets import Dataset as HFDataset
+        dataset = HFDataset.from_dict({"text": valid_texts})
+
         # Process with optimal batching
         results_list = []
         for out in tqdm(
-            self.classifier(valid_texts, self.config.size_type_labels, batch_size=self.config.bart_batch_size),
+            self.classifier(dataset["text"], self.config.size_type_labels, batch_size=self.config.bart_batch_size),
             total=len(valid_texts),
             desc="Classifying size types",
             leave=False
