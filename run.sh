@@ -60,6 +60,10 @@ case "$1" in
         echo -e "${GREEN}Running fashion_beta.py (FashionSigLIP classification)...${NC}"
         docker compose run --rm app python fashion_beta.py "${@:2}"
         ;;
+    fashion-test)
+        echo -e "${GREEN}Running fashion_clip_test.py (Test multiple fashion models)...${NC}"
+        docker compose run --rm app python fashion_clip_test.py "${@:2}"
+        ;;
     app)
         echo -e "${GREEN}Running app.py (Full pipeline)...${NC}"
         docker compose run --rm app python app.py "${@:2}"
@@ -74,13 +78,14 @@ case "$1" in
         echo "Usage: ./run.sh <command> [options]"
         echo ""
         echo "Commands:"
-        echo "  build     Build Docker image"
-        echo "  beta      Run embedding-only classification (BGE-M3, fast)"
-        echo "  beta2     Run RAG + LLM classification (most accurate, slow)"
-        echo "  beta3     Run embedding + cross-encoder re-ranking (accurate, medium)"
-        echo "  fashion   Run FashionSigLIP classification (fashion-optimized)"
-        echo "  app       Run full pipeline"
-        echo "  shell     Start interactive shell"
+        echo "  build        Build Docker image"
+        echo "  beta         Run embedding-only classification (BGE-M3, fast)"
+        echo "  beta2        Run RAG + LLM classification (most accurate, slow)"
+        echo "  beta3        Run embedding + cross-encoder re-ranking (accurate, medium)"
+        echo "  fashion      Run FashionSigLIP classification (fashion-optimized)"
+        echo "  fashion-test Test multiple fashion models (compare accuracy)"
+        echo "  app          Run full pipeline"
+        echo "  shell        Start interactive shell"
         echo ""
         echo "Examples:"
         echo "  ./run.sh build"
@@ -88,6 +93,7 @@ case "$1" in
         echo "  ./run.sh beta2 --top-k 5"
         echo "  ./run.sh beta3 --top-k 10"
         echo "  ./run.sh fashion --input inputs/products.csv"
+        echo "  ./run.sh fashion-test --all --limit 1000  # Test all fashion models"
         echo "  ./run.sh shell"
         ;;
 esac
