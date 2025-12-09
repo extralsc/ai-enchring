@@ -42,23 +42,23 @@ fi
 case "$1" in
     build)
         echo -e "${GREEN}Building Docker image...${NC}"
-        docker-compose build
+        docker compose build
         ;;
     beta)
         echo -e "${GREEN}Running beta.py (Embedding classification)...${NC}"
-        docker-compose run --rm app python beta.py "${@:2}"
+        docker compose run --rm app python beta.py "${@:2}"
         ;;
     beta2)
         echo -e "${GREEN}Running beta2.py (RAG + LLM classification)...${NC}"
-        docker-compose run --rm app python beta2.py "${@:2}"
+        docker compose run --rm app python beta2.py "${@:2}"
         ;;
     app)
         echo -e "${GREEN}Running app.py (Full pipeline)...${NC}"
-        docker-compose run --rm app python app.py "${@:2}"
+        docker compose run --rm app python app.py "${@:2}"
         ;;
     shell)
         echo -e "${GREEN}Starting interactive shell...${NC}"
-        docker-compose run --rm app bash
+        docker compose run --rm app bash
         ;;
     *)
         echo "Product Enrichment Pipeline"

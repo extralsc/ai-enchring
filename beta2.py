@@ -40,6 +40,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# vLLM fix: Disable torch.compile to avoid segfault on some systems
+os.environ["VLLM_USE_V1"] = "0"  # Use stable v0 engine
+os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+
 import asyncpg
 import torch
 from dotenv import load_dotenv
@@ -243,6 +247,8 @@ class LLMModel:
                     dtype="half",
                     gpu_memory_utilization=0.4,  # Lämna rum för embedding-modellen
                     trust_remote_code=True,
+                    enforce_eager=True,  # Disable CUDA graphs to prevent segfaults
+                    disable_custom_all_reduce=True,  # More stable
                 )
                 self.sampling_params = SamplingParams(
                     temperature=0.1,
