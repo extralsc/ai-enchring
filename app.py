@@ -72,8 +72,8 @@ class Config:
     fashion_model: str = "Marqo/marqo-fashionSigLIP"
     # Larger multilingual model (~1GB) - better accuracy for Swedish categories
     sentence_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-    # DeBERTa-v3-base is 3x FASTER than large, still accurate for zero-shot
-    zero_shot_model: str = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli-ling-wanli"
+    # DeBERTa-v3-base-zeroshot-v2.0 is the newest/best zero-shot classifier (2024)
+    zero_shot_model: str = "MoritzLaurer/deberta-v3-base-zeroshot-v2.0"
 
     # Prompts for CLIP
     color_prompts: list = field(default_factory=lambda: [
