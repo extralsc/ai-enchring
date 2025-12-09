@@ -735,11 +735,11 @@ class TaxonomyMapper:
         self.categories_by_gender = {}  # gender_id -> list of category indices
         self.category_embeddings_by_gender = {}  # gender_id -> embeddings tensor
 
-        # Load WikiDict dictionary for word-level translations
+        # Load WikiDict dictionary for word-level translations (fast, for enrichment)
         self.dictionary = get_dictionary()
         self.dictionary.load()
 
-        # Load neural translator for sentence-level translations
+        # Load GPT-SW3 translator for high-quality Swedish↔English translation
         self.translator = get_translator()
 
     def set_local_colors(self, colors: list[dict]):
@@ -787,6 +787,41 @@ class TaxonomyMapper:
         texts = [g["name"] for g in genders]
         logger.info(f"Gender embeddings: {texts}")
         self.gender_embeddings = self.model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
+
+    def _is_english(self, text: str) -> bool:
+        """Check if text appears to be English (not Swedish).
+
+        Uses simple heuristics - if text contains common English fashion terms
+        or lacks Swedish characters, it's likely English.
+        """
+        if not text:
+            return False
+
+        text_lower = text.lower()
+
+        # Common English fashion product types
+        english_terms = {
+            'jacket', 'coat', 'pants', 'trousers', 'shirt', 'dress', 'skirt',
+            'sweater', 'hoodie', 'vest', 'cardigan', 'blouse', 'shorts',
+            'jeans', 'leggings', 'tights', 'socks', 'underwear', 'bra',
+            'shoes', 'boots', 'sneakers', 'sandals', 'hat', 'cap', 'gloves',
+            'scarf', 'belt', 'bag', 'backpack', 'swimwear', 'bikini',
+            't-shirt', 'polo', 'fleece', 'softshell', 'hardshell', 'parka',
+            'blazer', 'suit', 'tie', 'top', 'bottom', 'outerwear', 'activewear'
+        }
+
+        # Check if any English term is in the text
+        for term in english_terms:
+            if term in text_lower:
+                return True
+
+        # Swedish-specific characters suggest it's Swedish
+        swedish_chars = {'å', 'ä', 'ö'}
+        if any(c in text_lower for c in swedish_chars):
+            return False
+
+        # If all ASCII and no Swedish indicators, assume English
+        return text.isascii()
 
     def map_batch_colors(self, detected: list[str], csv_colors: list[str],
                           detected_confidences: list[float] = None) -> list[dict]:
@@ -867,14 +902,29 @@ class TaxonomyMapper:
         if not self.local_categories:
             return [{"id": None, "name": None, "confidence": 0.0, "suggested_category": None} for _ in product_types]
 
-        # Build queries - multilingual model + dictionary enrichment should handle cross-language matching
+        # Build queries - use GPT-SW3 to translate English product types to Swedish
         queries = []
+
+        # Collect unique English product types for batch translation
+        unique_english_types = list(set(p for p in product_types if p and self._is_english(p)))
+
+        # Translate English product types to Swedish using GPT-SW3
+        translation_map = {}
+        if unique_english_types:
+            logger.info(f"Translating {len(unique_english_types)} unique English product types to Swedish with GPT-SW3...")
+            translated = self.translator.translate_batch(unique_english_types, src_lang='en')
+            translation_map = dict(zip(unique_english_types, translated))
+            logger.info(f"Translations: {list(translation_map.items())[:5]}...")
+
         for p, title, desc in zip(product_types, titles, descriptions):
             parts = []
 
-            # 1. Product type (e.g., "Pants", "Jacket", "Tröja")
+            # 1. Product type - include both original AND Swedish translation
             if p:
                 parts.append(p)
+                # Add GPT-SW3 translation if available
+                if p in translation_map and translation_map[p]:
+                    parts.append(translation_map[p])
 
             # 2. Title keywords
             if title:
@@ -884,7 +934,7 @@ class TaxonomyMapper:
             if desc:
                 parts.append(desc[:100])
 
-            # Build query and enrich with dictionary (adds translations both ways)
+            # Build query and enrich with dictionary (adds word-level translations)
             query = ' '.join(parts) if parts else 'unknown'
             query = self.dictionary.enrich_text(query)
             queries.append(query)
@@ -932,6 +982,17 @@ class TaxonomyMapper:
                         best_score = all_best_score
 
                 conf = round(best_score, 3)
+
+                # Safety check - should never happen but prevents crash
+                if best_idx is None:
+                    logger.warning(f"No category match found for product: {pt}")
+                    results.append({
+                        "id": None,
+                        "name": "unknown",
+                        "confidence": 0.0,
+                        "suggested_category": pt if pt else "unknown"
+                    })
+                    continue
 
                 if conf >= self.config.min_mapping_confidence:
                     results.append({
@@ -1255,11 +1316,19 @@ class LLMCategoryClassifier:
     def set_categories(self, categories: list[dict]):
         """Set available categories from database."""
         self.local_categories = categories
-        # Build category list - include ALL unique names
-        # The LLM needs to see all options to make good matches
+        # Build category list - limit to avoid prompt overflow
+        # Group unique names and create embeddings for semantic search
         cat_names = sorted(set(c["name"] for c in categories))
-        self.category_list_str = ", ".join(cat_names)  # ALL categories
-        logger.info(f"LLM Classifier: {len(cat_names)} categories available (all included in prompt)")
+        self.all_category_names = cat_names
+
+        # For LLM prompt, limit to 200 most common/important categories
+        # The LLM will match semantically, so we don't need ALL names
+        MAX_CATEGORIES_IN_PROMPT = 200
+        self.category_list_str = ", ".join(cat_names[:MAX_CATEGORIES_IN_PROMPT])
+        if len(cat_names) > MAX_CATEGORIES_IN_PROMPT:
+            self.category_list_str += f" (and {len(cat_names) - MAX_CATEGORIES_IN_PROMPT} more)"
+
+        logger.info(f"LLM Classifier: {len(cat_names)} categories, {min(len(cat_names), MAX_CATEGORIES_IN_PROMPT)} in prompt")
 
     def classify_batch(self, contexts: list[dict]) -> list[dict]:
         """
@@ -1372,7 +1441,7 @@ Response:"""
         return prompt
 
     def _parse_response(self, answer: str, cat_lookup: dict, ctx: dict) -> dict:
-        """Parse LLM response into structured result."""
+        """Parse LLM response into structured result. More robust parsing."""
         lines = answer.strip().split('\n')
 
         category_name = None
@@ -1381,20 +1450,27 @@ Response:"""
 
         for line in lines:
             line = line.strip()
-            if line.startswith('CATEGORY:'):
-                category_name = line.replace('CATEGORY:', '').strip()
-            elif line.startswith('CONFIDENCE:'):
-                conf_str = line.replace('CONFIDENCE:', '').strip().lower()
-                if 'high' in conf_str:
-                    confidence = 0.9
-                elif 'medium' in conf_str:
-                    confidence = 0.7
-                else:
-                    confidence = 0.4
-            elif line.startswith('SUGGESTION:'):
-                sugg = line.replace('SUGGESTION:', '').strip()
-                if sugg.lower() != 'none':
-                    suggestion = sugg
+            line_lower = line.lower()
+
+            # More robust parsing - handle variations like "Category:", "CATEGORY:", "category :"
+            if line_lower.startswith('category'):
+                # Extract after the colon
+                if ':' in line:
+                    category_name = line.split(':', 1)[1].strip()
+            elif line_lower.startswith('confidence'):
+                if ':' in line:
+                    conf_str = line.split(':', 1)[1].strip().lower()
+                    if 'high' in conf_str:
+                        confidence = 0.9
+                    elif 'medium' in conf_str or 'med' in conf_str:
+                        confidence = 0.7
+                    else:
+                        confidence = 0.4
+            elif line_lower.startswith('suggestion'):
+                if ':' in line:
+                    sugg = line.split(':', 1)[1].strip()
+                    if sugg.lower() not in ['none', 'n/a', '-', '']:
+                        suggestion = sugg
 
         # Find matching category
         cat_info = cat_lookup.get(category_name.lower() if category_name else '', {})
