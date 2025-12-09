@@ -75,7 +75,8 @@ class Config:
     # LLM-based category matching - uses a local LLM for accurate understanding
     # Much more accurate but slower than embedding matching
     use_llm_category: bool = True  # Enable for best accuracy
-    llm_model: str = "microsoft/Phi-3-mini-4k-instruct"  # Stable, fast LLM (~4GB) - good multilingual
+    llm_model: str = "Qwen/Qwen2.5-3B-Instruct"  # Good multilingual LLM
+    use_vllm: bool = True  # Use vLLM for faster, stable inference
     llm_confidence_threshold: float = 0.75  # Only use LLM if embedding confidence < this (saves time)
 
     # Models - OPTIMIZED for A10's 24GB VRAM
@@ -1474,34 +1475,58 @@ class LLMCategoryClassifier:
 
     This solves the problem of embedding similarity not understanding semantic meaning.
     The LLM reads the product info and determines the best category match.
+
+    Uses vLLM for fast, stable inference (2-4x faster than transformers).
     """
 
     def __init__(self, config: Config):
         self.config = config
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None
         self.tokenizer = None
         self.local_categories = []
         self.category_list_str = ""
 
     def load_model(self):
-        """Load the LLM model."""
+        """Load the LLM model using vLLM or transformers."""
         if self.model is not None:
             return
 
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        if self.config.use_vllm:
+            try:
+                from vllm import LLM, SamplingParams
+                logger.info(f"Loading LLM with vLLM: {self.config.llm_model}...")
+                self.model = LLM(
+                    model=self.config.llm_model,
+                    dtype="half",
+                    gpu_memory_utilization=0.5,  # Leave room for other models
+                    trust_remote_code=True,
+                )
+                self.sampling_params = SamplingParams(
+                    temperature=0.1,
+                    max_tokens=50,
+                )
+                self.use_vllm = True
+                logger.info("vLLM loaded successfully!")
+                return
+            except ImportError:
+                logger.warning("vLLM not installed, falling back to transformers")
+            except Exception as e:
+                logger.warning(f"vLLM failed: {e}, falling back to transformers")
 
-        logger.info(f"Loading LLM: {self.config.llm_model}...")
+        # Fallback to transformers
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        logger.info(f"Loading LLM with transformers: {self.config.llm_model}...")
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.llm_model,
             trust_remote_code=True
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.llm_model,
-            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.float16,
             device_map="auto",
             trust_remote_code=True
         )
+        self.use_vllm = False
         logger.info("LLM loaded successfully")
 
     def set_categories(self, categories: list[dict]):
@@ -1527,39 +1552,65 @@ class LLMCategoryClassifier:
 
         self.load_model()
 
-        results = []
-        batch_size = 8  # Small batch for LLM
-
         # Build category lookup
         cat_lookup = {c["name"].lower(): c for c in self.local_categories}
 
-        for i in range(0, len(contexts), batch_size):
-            batch = contexts[i:i + batch_size]
+        # Build all prompts
+        prompts = [self._build_prompt(ctx) for ctx in contexts]
 
-            for ctx in batch:
-                prompt = self._build_prompt(ctx)
+        if self.use_vllm:
+            # vLLM - process all at once (much faster!)
+            logger.info(f"vLLM generating {len(prompts)} responses...")
+            outputs = self.model.generate(prompts, self.sampling_params)
 
-                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            results = []
+            for output, ctx in zip(outputs, contexts):
+                answer = output.outputs[0].text.strip()
+                result = self._parse_response(answer, cat_lookup, ctx)
+                results.append(result)
+            return results
 
+        else:
+            # Transformers fallback - batch processing
+            from tqdm import tqdm
+            results = []
+            batch_size = 8
+
+            for i in tqdm(range(0, len(contexts), batch_size), desc="LLM classifying", unit="batch"):
+                batch_prompts = prompts[i:i + batch_size]
+                batch_contexts = contexts[i:i + batch_size]
+
+                # Tokenize all at once
+                inputs = self.tokenizer(
+                    batch_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=1024
+                )
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+                # Generate all at once
                 with torch.no_grad():
                     outputs = self.model.generate(
                         **inputs,
-                        max_new_tokens=100,
+                        max_new_tokens=50,
                         temperature=0.1,
                         do_sample=False,
                         pad_token_id=self.tokenizer.eos_token_id
                     )
 
-                response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                # Extract the answer after the prompt
-                answer = response[len(prompt):].strip()
+                # Decode all responses
+                responses = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-                # Parse the LLM response
-                result = self._parse_response(answer, cat_lookup, ctx)
-                results.append(result)
+                # Parse each response
+                for j, (response, ctx) in enumerate(zip(responses, batch_contexts)):
+                    prompt = batch_prompts[j]
+                    answer = response[len(prompt):].strip()
+                    result = self._parse_response(answer, cat_lookup, ctx)
+                    results.append(result)
 
-        return results
+            return results
 
     def _build_prompt(self, ctx: dict) -> str:
         """Build prompt for LLM category classification."""
