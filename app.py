@@ -462,31 +462,40 @@ class TaxonomyMapper:
                 parts.append(d)
             queries.append(' '.join(parts) if parts else 'unknown')
 
-        query_emb = self.model.encode(queries, convert_to_tensor=True, show_progress_bar=False)
-        sims = torch.nn.functional.cosine_similarity(query_emb.unsqueeze(1), self.color_embeddings.unsqueeze(0), dim=2)
-        best_idx = sims.argmax(dim=1)
-        best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
-
+        # Process in batches and use CPU for similarity to avoid OOM
+        BATCH_SIZE = 512
         results = []
-        for i, (idx, score) in enumerate(zip(best_idx, best_scores)):
-            conf = round(score.item(), 3)
-            csv_color = csv_colors[i] if i < len(csv_colors) else ''
+        color_cpu = self.color_embeddings.cpu()
+        result_idx = 0
 
-            if conf >= self.config.min_mapping_confidence:
-                # Good match - use local color
-                results.append({
-                    "id": self.local_colors[idx.item()]["id"],
-                    "name": self.local_colors[idx.item()]["name"],
-                    "confidence": conf,
-                    "suggestion": None
-                })
-            else:
-                # Poor match - suggest creating new color from CSV
-                results.append({
-                    "id": None,
-                    "name": "unknown",
-                    "confidence": conf,
-                    "suggestion": csv_color if csv_color else None
+        for i in range(0, len(queries), BATCH_SIZE):
+            batch_queries = queries[i:i + BATCH_SIZE]
+
+            query_emb = self.model.encode(batch_queries, convert_to_tensor=True, show_progress_bar=False)
+            query_cpu = query_emb.cpu()
+
+            sims = torch.nn.functional.cosine_similarity(query_cpu.unsqueeze(1), color_cpu.unsqueeze(0), dim=2)
+            best_idx = sims.argmax(dim=1)
+            best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+
+            for j, (idx, score) in enumerate(zip(best_idx, best_scores)):
+                conf = round(score.item(), 3)
+                csv_color = csv_colors[result_idx] if result_idx < len(csv_colors) else ''
+                result_idx += 1
+
+                if conf >= self.config.min_mapping_confidence:
+                    results.append({
+                        "id": self.local_colors[idx.item()]["id"],
+                        "name": self.local_colors[idx.item()]["name"],
+                        "confidence": conf,
+                        "suggestion": None
+                    })
+                else:
+                    results.append({
+                        "id": None,
+                        "name": "unknown",
+                        "confidence": conf,
+                        "suggestion": csv_color if csv_color else None
                 })
         return results
 
@@ -544,23 +553,37 @@ class TaxonomyMapper:
 
             queries.append(' '.join(parts) if parts else 'unknown')
 
-        query_emb = self.model.encode(queries, convert_to_tensor=True, show_progress_bar=False)
-        sims = torch.nn.functional.cosine_similarity(query_emb.unsqueeze(1), self.category_embeddings.unsqueeze(0), dim=2)
-        best_idx = sims.argmax(dim=1)
-        best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
-
-        # Return results, but mark as "unknown" if confidence too low
+        # Process in batches to avoid GPU OOM (N products x 830 categories = huge!)
+        BATCH_SIZE = 256
         results = []
-        for idx, score in zip(best_idx, best_scores):
-            conf = round(score.item(), 3)
-            if conf >= self.config.min_mapping_confidence:
-                results.append({
-                    "id": self.local_categories[idx.item()]["id"],
-                    "name": self.local_categories[idx.item()]["name"],
-                    "confidence": conf
-                })
-            else:
-                results.append({"id": None, "name": "unknown", "confidence": conf})
+
+        # Move category embeddings to CPU once
+        cat_cpu = self.category_embeddings.cpu()
+
+        for i in range(0, len(queries), BATCH_SIZE):
+            batch_queries = queries[i:i + BATCH_SIZE]
+
+            # Encode batch on GPU, then move to CPU for similarity
+            query_emb = self.model.encode(batch_queries, convert_to_tensor=True, show_progress_bar=False)
+            query_cpu = query_emb.cpu()
+
+            # Compute similarity on CPU to avoid GPU OOM
+            sims = torch.nn.functional.cosine_similarity(query_cpu.unsqueeze(1), cat_cpu.unsqueeze(0), dim=2)
+            best_idx = sims.argmax(dim=1)
+            best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+
+            # Build results for this batch
+            for idx, score in zip(best_idx, best_scores):
+                conf = round(score.item(), 3)
+                if conf >= self.config.min_mapping_confidence:
+                    results.append({
+                        "id": self.local_categories[idx.item()]["id"],
+                        "name": self.local_categories[idx.item()]["name"],
+                        "confidence": conf
+                    })
+                else:
+                    results.append({"id": None, "name": "unknown", "confidence": conf})
+
         return results
 
     def map_batch_genders(self, csv_genders: list[str]) -> list[dict]:
