@@ -50,16 +50,15 @@ class Config:
     # Database
     db_url: str = field(default_factory=lambda: os.getenv('DATABASE_URL', ''))
 
-    # Processing - FULLY UTILIZING A10 (23GB VRAM!)
-    # Currently using ~11GB, have ~11GB headroom - DOUBLE IT
-    batch_size: int = 1024  # Image processing batch (was 768)
+    # Processing - OPTIMIZED for A10 (23GB VRAM)
+    batch_size: int = 512  # Image processing batch (reduced to avoid OOM)
     max_concurrent_downloads: int = 1000  # Max async downloads
     download_timeout: int = 10  # Faster timeout
     use_fp16: bool = True
-    num_workers: int = 28  # Use more of 30 vCPUs
+    num_workers: int = 16  # CPU workers for image preprocessing
 
-    # Classification batch sizes - base model is smaller, can use bigger batches
-    bart_batch_size: int = 512  # Zero-shot classification batch (base model allows more)
+    # Classification batch sizes
+    bart_batch_size: int = 128  # Zero-shot classification batch
 
     # Speed vs accuracy tradeoff
     # Zero-shot category is SLOW (~80 labels) but accurate
@@ -997,23 +996,18 @@ class ProductEnrichmentPipeline:
             detected_categories = [r["category"] for r in all_clip_results]
             detected_category_confidences = [r["category_conf"] for r in all_clip_results]
 
-            # Map to local taxonomy IN PARALLEL (all use GPU sentence transformer)
-            logger.info("Mapping to local taxonomy (parallel)...")
+            # Free GPU memory before taxonomy mapping
+            torch.cuda.empty_cache()
 
-            # Run all three mappings concurrently
-            color_task = asyncio.create_task(asyncio.to_thread(
-                self.mapper.map_batch_colors, detected_colors, csv_colors, detected_color_confidences
-            ))
-            cat_task = asyncio.create_task(asyncio.to_thread(
-                self.mapper.map_batch_categories, detected_categories, product_types, google_categories, detected_category_confidences, titles
-            ))
-            gender_task = asyncio.create_task(asyncio.to_thread(
-                self.mapper.map_batch_genders, csv_genders
-            ))
-
-            mapped_colors, mapped_categories, mapped_genders = await asyncio.gather(
-                color_task, cat_task, gender_task
+            # Map to local taxonomy (sequential - parallel causes GPU OOM)
+            logger.info("Mapping to local taxonomy...")
+            mapped_colors = self.mapper.map_batch_colors(
+                detected_colors, csv_colors, detected_color_confidences
             )
+            mapped_categories = self.mapper.map_batch_categories(
+                detected_categories, product_types, google_categories, detected_category_confidences, titles
+            )
+            mapped_genders = self.mapper.map_batch_genders(csv_genders)
 
             # Enrich products
             logger.info("Enriching products...")
