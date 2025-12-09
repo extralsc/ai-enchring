@@ -46,23 +46,27 @@ load_dotenv()
 
 @dataclass
 class Config:
-    """Pipeline configuration - optimized for A10 GPU."""
+    """Pipeline configuration - MAXIMIZED for A10 GPU (24GB VRAM, 30 vCPUs, 226GB RAM)."""
     # Database
     db_url: str = field(default_factory=lambda: os.getenv('DATABASE_URL', ''))
 
-    # Processing - MAXIMIZED for A10
-    batch_size: int = 256  # Increased from 128
-    max_concurrent_downloads: int = 200  # Increased from 100
-    download_timeout: int = 15  # Reduced timeout for faster failure
+    # Processing - FULLY UTILIZING A10
+    batch_size: int = 512  # Image processing batch (was 256)
+    max_concurrent_downloads: int = 500  # Async downloads (was 200)
+    download_timeout: int = 10  # Faster timeout
     use_fp16: bool = True
-    num_workers: int = 8  # For DataLoader
+    num_workers: int = 16  # CPU workers (was 8)
 
-    # Models
+    # BART classifier batch sizes
+    bart_batch_size: int = 64  # For zero-shot classification (was 16-32)
+
+    # Models - LARGER/BETTER for A10's 24GB VRAM
     # Fashion-specific model - 57% better than generic CLIP for clothing
     fashion_model: str = "Marqo/marqo-fashionSigLIP"
-    # Multilingual model for Swedish categories + English queries
-    sentence_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    zero_shot_model: str = "facebook/bart-large-mnli"
+    # Larger multilingual model (~1GB vs 500MB) - better accuracy for Swedish
+    sentence_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    # DeBERTa is more accurate than BART for zero-shot (~2GB vs 1.5GB)
+    zero_shot_model: str = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
 
     # Prompts for CLIP
     color_prompts: list = field(default_factory=lambda: [
@@ -115,8 +119,8 @@ class Database:
         logger.info("Connecting to PostgreSQL...")
         self.pool = await asyncpg.create_pool(
             self.config.get_db_url(),
-            min_size=5,
-            max_size=20
+            min_size=10,
+            max_size=50  # More connections for 30 vCPUs
         )
         logger.info("Database connected")
 
@@ -624,9 +628,9 @@ class CategoryClassifier:
                 parts.append(ctx['description'][:150])
             texts.append(' '.join(parts) if parts else 'unknown product')
 
-        # Classify in batches
+        # Classify in batches - use config batch size
         results = []
-        batch_size = 16  # Smaller batches for many labels
+        batch_size = self.config.bart_batch_size
 
         for i in tqdm(range(0, len(texts), batch_size), desc="Classifying categories", leave=False):
             batch_texts = texts[i:i+batch_size]
@@ -721,7 +725,7 @@ class SizeTypeClassifier:
         # Process with optimal batching
         results_list = []
         for out in tqdm(
-            self.classifier(valid_texts, self.config.size_type_labels, batch_size=32),
+            self.classifier(valid_texts, self.config.size_type_labels, batch_size=self.config.bart_batch_size),
             total=len(valid_texts),
             desc="Classifying size types",
             leave=False
