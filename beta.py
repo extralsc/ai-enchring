@@ -417,10 +417,16 @@ class HierarchicalClassifier:
             weight_desc=self.config.l1_weight_desc
         )
 
-        # Debug: visa första produktens fält
+        # Debug: visa produkters fält
         if products:
-            pt, t, d, gc = self._get_product_fields(products[0])
-            logger.info(f"Exempel produkt 1: type='{pt}', google='{gc}', gender='{products[0].get('gender', '')}'")
+            p0 = products[0]
+            logger.info(f"CSV kolumner: {list(p0.keys())}")
+            logger.info(f"")
+            logger.info(f"=== FÖRSTA 50 PRODUKTER ===")
+            for i, p in enumerate(products[:50]):
+                pt, t, d, gc = self._get_product_fields(p)
+                logger.info(f"{i+1}. type='{pt}' | google='{gc}' | title='{t[:40]}...' | gender='{p.get('gender', '')}'")
+            logger.info(f"")
             logger.info(f"Gender-grupper: {list(gender_groups.keys())}")
 
         # Matcha varje gender-grupp mot sina kategorier
