@@ -38,8 +38,8 @@ tqdm>=4.66.0
 # Numerical
 numpy>=1.24.0
 
-# Neural translation (Helsinki-NLP MarianMT)
-sentencepiece>=0.1.99
+# Neural translation (AI-Sweden GPT-SW3 - loaded via transformers/vLLM)
+# No additional dependencies needed - uses transformers AutoModelForCausalLM
 
 # vLLM for fast LLM inference (optional but recommended)
 # Install separately: pip install vllm

@@ -29,7 +29,7 @@ from tqdm import tqdm
 import open_clip
 from transformers import pipeline
 from sentence_transformers import SentenceTransformer
-from transformers import MarianMTModel, MarianTokenizer
+# GPT-SW3 translator uses AutoModelForCausalLM (loaded in NeuralTranslator class)
 
 # Configure logging
 logging.basicConfig(
@@ -188,89 +188,149 @@ class Config:
 
 
 # =============================================================================
-# NEURAL MACHINE TRANSLATION - For any language → English
+# NEURAL MACHINE TRANSLATION - Using AI-Sweden GPT-SW3 Translator
 # =============================================================================
 
 class NeuralTranslator:
-    """Neural machine translation for multi-language support.
+    """Neural machine translation using AI-Sweden GPT-SW3-6.7B-v2-translator.
 
-    Uses Helsinki-NLP MarianMT models to translate ANY language to English.
-    This handles the 70+ suppliers with different languages/terminology.
+    High-quality Swedish↔English translation optimized for Nordic languages.
+    Uses vLLM for fast, efficient inference on GPU.
     """
+
+    MODEL_NAME = "AI-Sweden-Models/gpt-sw3-6.7b-v2-translator"
 
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.models = {}  # Cache loaded models
-        self.tokenizers = {}
+        self.model = None
+        self.tokenizer = None
+        self.use_vllm = False
 
-    def _load_model(self, src_lang: str):
-        """Lazy load translation model for source language."""
-        if src_lang in self.models:
+    def _load_model(self):
+        """Lazy load GPT-SW3 translator model."""
+        if self.model is not None:
             return
 
-        # Map common language codes to Helsinki-NLP model names
-        model_map = {
-            'sv': 'Helsinki-NLP/opus-mt-sv-en',  # Swedish
-            'de': 'Helsinki-NLP/opus-mt-de-en',  # German
-            'fr': 'Helsinki-NLP/opus-mt-fr-en',  # French
-            'es': 'Helsinki-NLP/opus-mt-es-en',  # Spanish
-            'it': 'Helsinki-NLP/opus-mt-it-en',  # Italian
-            'nl': 'Helsinki-NLP/opus-mt-nl-en',  # Dutch
-            'da': 'Helsinki-NLP/opus-mt-da-en',  # Danish
-            'no': 'Helsinki-NLP/opus-mt-no-en',  # Norwegian
-            'fi': 'Helsinki-NLP/opus-mt-fi-en',  # Finnish
-            'pl': 'Helsinki-NLP/opus-mt-pl-en',  # Polish
-            'mul': 'Helsinki-NLP/opus-mt-mul-en', # Multilingual fallback
-        }
-
-        model_name = model_map.get(src_lang, model_map['mul'])
-
+        # Try vLLM first (faster, more memory efficient)
         try:
-            logger.info(f"Loading translation model: {model_name}")
-            self.tokenizers[src_lang] = MarianTokenizer.from_pretrained(model_name)
-            self.models[src_lang] = MarianMTModel.from_pretrained(model_name).to(self.device)
-            if self.device == "cuda":
-                self.models[src_lang] = self.models[src_lang].half()
-            logger.info(f"Translation model loaded: {src_lang} → English")
+            from vllm import LLM, SamplingParams
+            logger.info(f"Loading GPT-SW3 translator with vLLM: {self.MODEL_NAME}...")
+            self.model = LLM(
+                model=self.MODEL_NAME,
+                dtype="half",
+                gpu_memory_utilization=0.25,  # Conservative - leave room for other models
+                trust_remote_code=True,
+                max_model_len=512,  # Translation doesn't need long context
+            )
+            self.sampling_params = SamplingParams(
+                temperature=0.1,
+                max_tokens=256,
+                stop=["<s>", "</s>", "<|endoftext|>"],
+            )
+            self.use_vllm = True
+            logger.info("GPT-SW3 translator loaded with vLLM!")
+            return
+        except ImportError:
+            logger.warning("vLLM not installed, falling back to transformers")
         except Exception as e:
-            logger.warning(f"Failed to load {model_name}: {e}, falling back to multilingual")
-            if src_lang != 'mul':
-                self._load_model('mul')
-                self.models[src_lang] = self.models['mul']
-                self.tokenizers[src_lang] = self.tokenizers['mul']
+            logger.warning(f"vLLM failed for GPT-SW3: {e}, falling back to transformers")
+
+        # Fallback to transformers pipeline
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        logger.info(f"Loading GPT-SW3 translator with transformers: {self.MODEL_NAME}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL_NAME)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.MODEL_NAME,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        self.use_vllm = False
+        logger.info("GPT-SW3 translator loaded with transformers!")
+
+    def _build_prompt(self, text: str, direction: str = "sv_to_en") -> str:
+        """Build translation prompt for GPT-SW3."""
+        if direction == "sv_to_en":
+            return f"<|endoftext|><s>User: Översätt till Engelska från Svenska\n{text}<s>Bot:"
+        else:  # en_to_sv
+            return f"<|endoftext|><s>User: Översätt till Svenska från Engelska\n{text}<s>Bot:"
 
     def translate_batch(self, texts: list[str], src_lang: str = 'sv') -> list[str]:
-        """Translate batch of texts from source language to English."""
+        """Translate batch of texts. Supports Swedish↔English.
+
+        Args:
+            texts: List of texts to translate
+            src_lang: Source language ('sv' for Swedish→English, 'en' for English→Swedish)
+        """
         if not texts:
             return []
 
-        self._load_model(src_lang)
-
-        if src_lang not in self.models:
-            logger.warning(f"No model for {src_lang}, returning original texts")
+        # GPT-SW3 is optimized for Swedish↔English
+        # For other languages, return original (they'll use dictionary fallback)
+        if src_lang not in ('sv', 'en'):
+            logger.debug(f"GPT-SW3 doesn't support {src_lang}, returning original texts")
             return texts
 
-        model = self.models[src_lang]
-        tokenizer = self.tokenizers[src_lang]
+        self._load_model()
 
-        # Batch translate
-        translated = []
-        batch_size = 32  # Smaller batches for translation
+        direction = "sv_to_en" if src_lang == 'sv' else "en_to_sv"
 
-        with torch.no_grad():
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i:i + batch_size]
-                # Truncate long texts
-                batch = [t[:500] if t else "" for t in batch]
+        # Truncate long texts
+        texts = [t[:400] if t else "" for t in texts]
 
-                inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512)
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Build prompts
+        prompts = [self._build_prompt(t, direction) for t in texts]
 
-                outputs = model.generate(**inputs, max_length=512)
-                decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-                translated.extend(decoded)
+        if self.use_vllm:
+            # vLLM - process all at once
+            outputs = self.model.generate(prompts, self.sampling_params)
+            translations = []
+            for output in outputs:
+                translation = output.outputs[0].text.strip()
+                # Clean up any trailing special tokens
+                for stop in ["<s>", "</s>", "<|endoftext|>"]:
+                    if translation.endswith(stop):
+                        translation = translation[:-len(stop)].strip()
+                translations.append(translation)
+            return translations
+        else:
+            # Transformers fallback - batch processing
+            translations = []
+            batch_size = 8
 
-        return translated
+            with torch.no_grad():
+                for i in range(0, len(prompts), batch_size):
+                    batch_prompts = prompts[i:i + batch_size]
+
+                    inputs = self.tokenizer(
+                        batch_prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=512
+                    )
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=256,
+                        temperature=0.1,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+
+                    responses = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+                    for j, response in enumerate(responses):
+                        # Extract translation (after the prompt)
+                        prompt_len = len(batch_prompts[j])
+                        translation = response[prompt_len:].strip()
+                        # Clean up special tokens
+                        for stop in ["<s>", "</s>", "<|endoftext|>", "Bot:"]:
+                            translation = translation.replace(stop, "").strip()
+                        translations.append(translation)
+
+            return translations
 
     def detect_and_translate(self, text: str) -> tuple[str, str]:
         """Detect language and translate to English if needed.
@@ -285,9 +345,8 @@ class NeuralTranslator:
 
         # Swedish indicators
         swedish_words = ['och', 'för', 'med', 'som', 'är', 'att', 'av', 'på', 'den', 'det', 'i', 'till']
-        # German indicators
+        # German/French etc. - GPT-SW3 focuses on Swedish, so we skip others
         german_words = ['und', 'für', 'mit', 'ist', 'das', 'die', 'der', 'ein', 'eine', 'zu']
-        # French indicators
         french_words = ['et', 'pour', 'avec', 'est', 'le', 'la', 'les', 'un', 'une', 'de']
 
         words = text_lower.split()
@@ -297,17 +356,15 @@ class NeuralTranslator:
         french_count = sum(1 for w in words if w in french_words)
 
         if swedish_count > german_count and swedish_count > french_count and swedish_count > 1:
-            lang = 'sv'
-        elif german_count > swedish_count and german_count > french_count and german_count > 1:
-            lang = 'de'
-        elif french_count > swedish_count and french_count > german_count and french_count > 1:
-            lang = 'fr'
+            # Swedish text - translate to English
+            translated = self.translate_batch([text], 'sv')[0]
+            return translated, 'sv'
+        elif german_count > 1 or french_count > 1:
+            # Other languages - GPT-SW3 doesn't support, return original
+            return text, 'other'
         else:
-            # Assume English or use multilingual
+            # Assume English - no translation needed
             return text, 'en'
-
-        translated = self.translate_batch([text], lang)[0]
-        return translated, lang
 
 
 # Global translator instance (lazy loaded)
@@ -810,7 +867,7 @@ class TaxonomyMapper:
         if not self.local_categories:
             return [{"id": None, "name": None, "confidence": 0.0, "suggested_category": None} for _ in product_types]
 
-        # Build queries from Swedish text - use dictionary for enrichment
+        # Build queries - multilingual model + dictionary enrichment should handle cross-language matching
         queries = []
         for p, title, desc in zip(product_types, titles, descriptions):
             parts = []
@@ -819,16 +876,15 @@ class TaxonomyMapper:
             if p:
                 parts.append(p)
 
-            # 2. Title keywords (e.g., "Houdini M's Ride Pants" → extract "Pants")
+            # 2. Title keywords
             if title:
                 parts.append(title)
 
-            # 3. Description (Swedish text, e.g., "skalbyxor", "polotröja")
+            # 3. Description (often contains Swedish keywords)
             if desc:
-                # Take first 100 chars of description for key terms
                 parts.append(desc[:100])
 
-            # Build query and enrich with dictionary translations
+            # Build query and enrich with dictionary (adds translations both ways)
             query = ' '.join(parts) if parts else 'unknown'
             query = self.dictionary.enrich_text(query)
             queries.append(query)
@@ -847,24 +903,35 @@ class TaxonomyMapper:
             query_emb = self.model.encode(batch_queries, convert_to_tensor=True, show_progress_bar=False)
 
             # Process each product with its gender filter
+            # FALLBACK THRESHOLD: If gender-filtered match is weak, try ALL categories
+            GENDER_FALLBACK_THRESHOLD = 0.65
+
             for j, (q_emb, gender_id, pt, title) in enumerate(zip(query_emb, batch_gender_ids, batch_product_types, batch_titles)):
-                # Get categories for this gender
+                best_idx = None
+                best_score = 0.0
+
+                # Step 1: Try gender-filtered categories first
                 if gender_id in self.categories_by_gender:
                     cat_indices = self.categories_by_gender[gender_id]
                     cat_emb = self.category_embeddings_by_gender[gender_id]
-                else:
-                    # Fallback to all categories if gender not found
-                    cat_indices = list(range(len(self.local_categories)))
-                    cat_emb = self.category_embeddings
 
-                # Compute similarity
-                sims = torch.nn.functional.cosine_similarity(q_emb.unsqueeze(0), cat_emb, dim=1)
-                best_local_idx = sims.argmax().item()
-                best_score = sims[best_local_idx].item()
+                    sims = torch.nn.functional.cosine_similarity(q_emb.unsqueeze(0), cat_emb, dim=1)
+                    best_local_idx = sims.argmax().item()
+                    best_score = sims[best_local_idx].item()
+                    best_idx = cat_indices[best_local_idx]
+
+                # Step 2: If gender match is weak OR gender not found, also try ALL categories
+                if best_score < GENDER_FALLBACK_THRESHOLD or best_idx is None:
+                    all_sims = torch.nn.functional.cosine_similarity(q_emb.unsqueeze(0), self.category_embeddings, dim=1)
+                    all_best_idx = all_sims.argmax().item()
+                    all_best_score = all_sims[all_best_idx].item()
+
+                    # Use the better match (gender-filtered OR all categories)
+                    if all_best_score > best_score:
+                        best_idx = all_best_idx
+                        best_score = all_best_score
+
                 conf = round(best_score, 3)
-
-                # Map back to original category index
-                best_idx = cat_indices[best_local_idx]
 
                 if conf >= self.config.min_mapping_confidence:
                     results.append({
@@ -1188,11 +1255,11 @@ class LLMCategoryClassifier:
     def set_categories(self, categories: list[dict]):
         """Set available categories from database."""
         self.local_categories = categories
-        # Build a concise category list for the prompt
-        # Group by parent for clarity
+        # Build category list - include ALL unique names
+        # The LLM needs to see all options to make good matches
         cat_names = sorted(set(c["name"] for c in categories))
-        self.category_list_str = ", ".join(cat_names[:100])  # Top 100 for prompt length
-        logger.info(f"LLM Classifier: {len(cat_names)} categories available")
+        self.category_list_str = ", ".join(cat_names)  # ALL categories
+        logger.info(f"LLM Classifier: {len(cat_names)} categories available (all included in prompt)")
 
     def classify_batch(self, contexts: list[dict]) -> list[dict]:
         """
@@ -1274,22 +1341,30 @@ class LLMCategoryClassifier:
         title = ctx.get('title', '')
         description = ctx.get('description', '')[:300]
 
-        prompt = f"""You are a product categorization expert. Given a product, determine the best category.
+        prompt = f"""You are a Swedish e-commerce product categorization expert. Match products to Swedish category names.
 
 Product Information:
 - Type: {product_type}
 - Title: {title}
 - Description: {description}
 
-Available Categories: {self.category_list_str}
+Available Categories (Swedish): {self.category_list_str}
+
+IMPORTANT: Categories are in Swedish. Common translations:
+- Jacket/Coat = Jacka, Ytterplagg, Skaljacka
+- Pants/Trousers = Byxor, Skalbyxor
+- Shirt = Skjorta, Tröja
+- Dress = Klänning
+- Shoes = Skor
+- Boots = Stövlar, Kängor
 
 Instructions:
-1. Understand what this product is (e.g., ski pants, dress, base layer, etc.)
-2. Find the BEST matching category from the list
-3. If no good match exists, suggest a new category name
+1. Understand what this product IS (jacket, pants, shoes, etc.)
+2. Find the BEST matching Swedish category from the list
+3. Match semantically - "Jacket" should match "Jacka" or "Ytterplagg"
 
 Respond in this exact format:
-CATEGORY: [category name]
+CATEGORY: [exact Swedish category name from the list]
 CONFIDENCE: [high/medium/low]
 SUGGESTION: [new category name if no good match, otherwise "none"]
 
