@@ -51,23 +51,29 @@ class Config:
     db_url: str = field(default_factory=lambda: os.getenv('DATABASE_URL', ''))
 
     # Processing - FULLY UTILIZING A10 (23GB VRAM!)
-    batch_size: int = 768  # Image processing batch - INCREASED for 23GB
+    # Currently using ~11GB, have ~11GB headroom - DOUBLE IT
+    batch_size: int = 1024  # Image processing batch (was 768)
     max_concurrent_downloads: int = 1000  # Max async downloads
     download_timeout: int = 10  # Faster timeout
     use_fp16: bool = True
-    num_workers: int = 24  # Use more of 30 vCPUs
+    num_workers: int = 28  # Use more of 30 vCPUs
 
-    # Classification batch sizes - INCREASED for 23GB VRAM
-    bart_batch_size: int = 128  # Zero-shot classification batch (was 64)
+    # Classification batch sizes - base model is smaller, can use bigger batches
+    bart_batch_size: int = 512  # Zero-shot classification batch (base model allows more)
 
-    # Models - LARGER/BETTER for A10's 24GB VRAM
-    # FashionCLIP (ViT-L-14) is larger and 7% more accurate than FashionSigLIP (ViT-B-16)
-    # Uses ~3GB vs ~1.5GB - better results, still fits easily
-    fashion_model: str = "Marqo/marqo-fashionCLIP"
+    # Speed vs accuracy tradeoff
+    # Zero-shot category is SLOW (~80 labels) but accurate
+    # Sentence similarity is FAST but less accurate
+    # Set to False for ~3x faster processing
+    use_zeroshot_category: bool = False  # Disable slow zero-shot, use sentence similarity
+
+    # Models - OPTIMIZED for A10's 24GB VRAM
+    # FashionSigLIP outperforms FashionCLIP on fashion benchmarks
+    fashion_model: str = "Marqo/marqo-fashionSigLIP"
     # Larger multilingual model (~1GB) - better accuracy for Swedish categories
     sentence_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-    # DeBERTa-v3-large is most accurate zero-shot classifier (~2GB)
-    zero_shot_model: str = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
+    # DeBERTa-v3-base is 3x FASTER than large, still accurate for zero-shot
+    zero_shot_model: str = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli-ling-wanli"
 
     # Prompts for CLIP
     color_prompts: list = field(default_factory=lambda: [
@@ -214,43 +220,41 @@ class FastImageDownloader:
 
 
 # =============================================================================
-# FASHION IMAGE PROCESSOR - Using Marqo FashionCLIP (ViT-L-14)
+# FASHION IMAGE PROCESSOR - Using Marqo FashionSigLIP
 # =============================================================================
 
 class FashionImageProcessor:
-    """Fashion-specific image processor using Marqo FashionCLIP model.
+    """Fashion-specific image processor using Marqo FashionSigLIP model.
 
-    FashionCLIP (ViT-L-14) is 7% more accurate than FashionSigLIP (ViT-B-16).
-    Uses ~3GB VRAM vs ~1.5GB, but we have 23GB available.
+    +57% better recall than generic CLIP for fashion/clothing detection.
     Trained specifically on fashion colors, categories, materials, and styles.
     """
 
     def __init__(self, config: Config):
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"FashionCLIP using device: {self.device}")
+        logger.info(f"FashionSigLIP using device: {self.device}")
 
         # Load fashion-specific model using open_clip
         logger.info(f"Loading {config.fashion_model}...")
-        try:
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-                f'hf-hub:{config.fashion_model}'
-            )
-            self.tokenizer = open_clip.get_tokenizer(f'hf-hub:{config.fashion_model}')
-        except Exception as e:
-            # Fallback to FashionSigLIP if FashionCLIP fails
-            logger.warning(f"Failed to load {config.fashion_model}: {e}")
-            logger.info("Falling back to Marqo/marqo-fashionSigLIP...")
-            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-                'hf-hub:Marqo/marqo-fashionSigLIP'
-            )
-            self.tokenizer = open_clip.get_tokenizer('hf-hub:Marqo/marqo-fashionSigLIP')
+        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+            f'hf-hub:{config.fashion_model}'
+        )
+        self.tokenizer = open_clip.get_tokenizer(f'hf-hub:{config.fashion_model}')
 
         # Optimize for speed
         self.model = self.model.to(self.device)
         if config.use_fp16 and self.device == "cuda":
             self.model = self.model.half()
         self.model.eval()
+
+        # Compile model for 20-40% speedup (PyTorch 2.0+)
+        if hasattr(torch, 'compile') and self.device == "cuda":
+            try:
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("FashionSigLIP compiled with torch.compile() for faster inference")
+            except Exception as e:
+                logger.warning(f"torch.compile() failed for FashionSigLIP: {e}")
 
         # Pre-compute text embeddings for colors and categories
         self._precompute_embeddings()
@@ -425,9 +429,14 @@ class TaxonomyMapper:
 
     def map_batch_colors(self, detected: list[str], csv_colors: list[str],
                           detected_confidences: list[float] = None) -> list[dict]:
-        """Map batch of colors to local taxonomy."""
+        """Map batch of colors to local taxonomy.
+
+        Returns dict with: id, name, confidence, suggestion
+        - If confidence >= threshold: returns matched local color
+        - If confidence < threshold: returns "unknown" + suggestion to create new color
+        """
         if not self.local_colors:
-            return [{"id": None, "name": None, "confidence": 0.0} for _ in detected]
+            return [{"id": None, "name": "unknown", "confidence": 0.0, "suggestion": c} for c in csv_colors]
 
         if detected_confidences is None:
             detected_confidences = [1.0] * len(detected)
@@ -452,10 +461,28 @@ class TaxonomyMapper:
         best_idx = sims.argmax(dim=1)
         best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
 
-        return [
-            {"id": self.local_colors[idx.item()]["id"], "name": self.local_colors[idx.item()]["name"], "confidence": round(score.item(), 3)}
-            for idx, score in zip(best_idx, best_scores)
-        ]
+        results = []
+        for i, (idx, score) in enumerate(zip(best_idx, best_scores)):
+            conf = round(score.item(), 3)
+            csv_color = csv_colors[i] if i < len(csv_colors) else ''
+
+            if conf >= self.config.min_mapping_confidence:
+                # Good match - use local color
+                results.append({
+                    "id": self.local_colors[idx.item()]["id"],
+                    "name": self.local_colors[idx.item()]["name"],
+                    "confidence": conf,
+                    "suggestion": None
+                })
+            else:
+                # Poor match - suggest creating new color from CSV
+                results.append({
+                    "id": None,
+                    "name": "unknown",
+                    "confidence": conf,
+                    "suggestion": csv_color if csv_color else None
+                })
+        return results
 
     def map_batch_categories(self, detected: list[str], product_types: list[str],
                               google_categories: list[str] = None, detected_confidences: list[float] = None,
@@ -702,12 +729,23 @@ class SizeTypeClassifier:
     def __init__(self, config: Config):
         self.config = config
         self.device = 0 if torch.cuda.is_available() else -1
+
+        # Load with optimizations
         self.classifier = pipeline(
             "zero-shot-classification",
             model=config.zero_shot_model,
             device=self.device,
-            dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=torch.float16,
         )
+
+        # Compile model for 20-40% speedup (PyTorch 2.0+)
+        if hasattr(torch, 'compile') and torch.cuda.is_available():
+            try:
+                self.classifier.model = torch.compile(self.classifier.model, mode="reduce-overhead")
+                logger.info("Zero-shot model compiled with torch.compile() for faster inference")
+            except Exception as e:
+                logger.warning(f"torch.compile() failed (will use uncompiled): {e}")
 
     def classify_all(self, contexts: list[dict]) -> list[dict]:
         """
@@ -900,11 +938,15 @@ class ProductEnrichmentPipeline:
                 asyncio.to_thread(self.size_classifier.classify_all, size_contexts)
             )
 
-            # PARALLEL TASK 2: Zero-shot category classification (doesn't need images!)
-            logger.info("Starting category classification (parallel)...")
-            category_task = asyncio.create_task(
-                asyncio.to_thread(self.category_classifier.classify_batch, size_contexts)
-            )
+            # PARALLEL TASK 2: Zero-shot category classification (OPTIONAL - slow but accurate)
+            category_task = None
+            if self.config.use_zeroshot_category:
+                logger.info("Starting zero-shot category classification (parallel)...")
+                category_task = asyncio.create_task(
+                    asyncio.to_thread(self.category_classifier.classify_batch, size_contexts)
+                )
+            else:
+                logger.info("Skipping zero-shot category (use_zeroshot_category=False for speed)")
 
             # PARALLEL TASK 3: Process images in batches
             all_clip_results = []
@@ -929,9 +971,15 @@ class ProductEnrichmentPipeline:
                 logger.info(f"Image downloads: {downloader.stats['success']} success, {downloader.stats['failed']} failed")
 
             # Wait for parallel tasks to complete
-            logger.info("Waiting for size/category classification to complete...")
+            logger.info("Waiting for classification to complete...")
             size_results = await size_task
-            zeroshot_categories = await category_task
+
+            # Only await category if enabled
+            if category_task:
+                zeroshot_categories = await category_task
+            else:
+                # Use empty results when disabled
+                zeroshot_categories = [{"id": None, "name": None, "confidence": 0.0, "suggestion": None} for _ in products]
             logger.info("Classification tasks complete!")
 
             # Extract detected values with confidence scores
@@ -954,12 +1002,13 @@ class ProductEnrichmentPipeline:
             # Enrich products
             logger.info("Enriching products...")
             for i, product in enumerate(products):
-                # Color
+                # Color - maps supplier color to local color, suggests new if no match
                 product['detected_color'] = detected_colors[i]
                 product['detected_color_confidence'] = all_clip_results[i]["color_conf"]
                 product['mapped_local_color_id'] = mapped_colors[i]["id"]
                 product['mapped_local_color'] = mapped_colors[i]["name"]
                 product['color_mapping_confidence'] = mapped_colors[i]["confidence"]
+                product['suggestion_create_color_name'] = mapped_colors[i]["suggestion"]
 
                 # Category (image-based + similarity matching - kept for comparison)
                 product['detected_category'] = detected_categories[i]
@@ -977,11 +1026,18 @@ class ProductEnrichmentPipeline:
                 product['mapped_local_gender'] = mapped_genders[i]["name"]
                 product['gender_mapping_confidence'] = mapped_genders[i]["confidence"]
 
-                # Zero-shot category classification (BART - most accurate)
-                product['zeroshot_category_id'] = zeroshot_categories[i]["id"]
-                product['zeroshot_category'] = zeroshot_categories[i]["name"]
-                product['zeroshot_category_confidence'] = zeroshot_categories[i]["confidence"]
-                product['suggestion_create_category_name'] = zeroshot_categories[i]["suggestion"]
+                # Zero-shot category classification (only if enabled)
+                if self.config.use_zeroshot_category:
+                    product['zeroshot_category_id'] = zeroshot_categories[i]["id"]
+                    product['zeroshot_category'] = zeroshot_categories[i]["name"]
+                    product['zeroshot_category_confidence'] = zeroshot_categories[i]["confidence"]
+                    product['suggestion_create_category_name'] = zeroshot_categories[i]["suggestion"]
+                else:
+                    # Use sentence similarity results as primary when zero-shot disabled
+                    product['zeroshot_category_id'] = mapped_categories[i]["id"]
+                    product['zeroshot_category'] = mapped_categories[i]["name"]
+                    product['zeroshot_category_confidence'] = mapped_categories[i]["confidence"]
+                    product['suggestion_create_category_name'] = product_types[i] if mapped_categories[i]["confidence"] < self.config.min_mapping_confidence else None
 
             # Write output
             self.write_csv(products, output_path)
