@@ -308,22 +308,29 @@ class HierarchicalClassifier:
         self.model = embedding_model
         self.max_levels = 4
 
-    def _get_product_fields(self, product: dict) -> tuple[str, str, str]:
+    def _get_product_fields(self, product: dict) -> tuple[str, str, str, str]:
         """Extrahera produktfält."""
         product_type = (product.get('product_type', '') or '').strip()
         title = (product.get('title', '') or '').strip()
         description = ((product.get('description', '') or '')[:300]).strip()
-        return product_type, title, description
+
+        # Extrahera mest specifika delen av google_product_category
+        # "Apparel & Accessories > Clothing > Sweaters & Hoodies" -> "Sweaters & Hoodies"
+        google_cat = product.get('google_product_category', '') or ''
+        if '>' in google_cat:
+            google_cat = google_cat.split('>')[-1].strip()
+
+        return product_type, title, description, google_cat
 
     def _build_product_text(self, product: dict, level: int = 1) -> str:
         """Bygg produkttext för embedding (fallback om weighted inte används)."""
-        product_type, title, description = self._get_product_fields(product)
+        product_type, title, description, google_cat = self._get_product_fields(product)
 
         if level == 1:
-            parts = [p for p in [product_type, title] if p]
+            parts = [p for p in [product_type, google_cat, title] if p]
             return ' | '.join(parts) if parts else 'unknown'
         else:
-            parts = [p for p in [product_type, title, description] if p]
+            parts = [p for p in [product_type, google_cat, title] if p]  # Skip description
             return ' | '.join(parts) if parts else 'unknown'
 
     def encode_products_weighted(self, products: list[dict],
@@ -333,28 +340,34 @@ class HierarchicalClassifier:
         """
         Skapa viktade embeddings för produkter.
 
-        Varje fält (product_type, title, description) får sin egen embedding,
-        sedan kombineras de med vikter för bättre precision.
+        Använder: product_type, google_product_category, title
+        Skippar description (orsakar brus).
         """
         # Extrahera fält
         types = []
+        google_cats = []
         titles = []
-        descs = []
         for p in products:
-            pt, t, d = self._get_product_fields(p)
+            pt, t, d, gc = self._get_product_fields(p)
             types.append(pt if pt else 'unknown')
+            google_cats.append(gc if gc else pt if pt else 'unknown')  # Fallback till product_type
             titles.append(t if t else 'unknown')
-            descs.append(d if d else 'unknown')
 
-        # Skapa separata embeddings (ingen prefix för BGE-M3)
+        # Skapa separata embeddings
         emb_types = self.model.encode(types)
+        emb_google = self.model.encode(google_cats)
         emb_titles = self.model.encode(titles)
-        emb_descs = self.model.encode(descs)
 
-        # Viktad kombination
-        combined = (weight_type * emb_types +
-                   weight_title * emb_titles +
-                   weight_desc * emb_descs)
+        # Viktad kombination: type + google_cat + title (ingen description)
+        # Normalisera vikter så de summerar till 1.0
+        total = weight_type + weight_title + weight_desc
+        w_type = (weight_type * 0.5) / total  # Dela type-vikt med google
+        w_google = (weight_type * 0.5) / total
+        w_title = (weight_title + weight_desc) / total  # Title tar över desc-vikt
+
+        combined = (w_type * emb_types +
+                   w_google * emb_google +
+                   w_title * emb_titles)
 
         # Normalisera för cosine similarity
         combined = torch.nn.functional.normalize(combined, p=2, dim=1)
@@ -406,8 +419,8 @@ class HierarchicalClassifier:
 
         # Debug: visa första produktens fält
         if products:
-            pt, t, d = self._get_product_fields(products[0])
-            logger.info(f"Exempel produkt 1: type='{pt}', title='{t[:40]}...', gender='{products[0].get('gender', '')}'")
+            pt, t, d, gc = self._get_product_fields(products[0])
+            logger.info(f"Exempel produkt 1: type='{pt}', google='{gc}', gender='{products[0].get('gender', '')}'")
             logger.info(f"Gender-grupper: {list(gender_groups.keys())}")
 
         # Matcha varje gender-grupp mot sina kategorier
