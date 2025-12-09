@@ -61,6 +61,16 @@ class Config:
     max_length: int = 256
     min_confidence: float = 0.5  # Minimum confidence för match
 
+    # Vikter för Level 1 (product_type + title, ingen description)
+    l1_weight_type: float = 0.6
+    l1_weight_title: float = 0.4
+    l1_weight_desc: float = 0.0
+
+    # Vikter för Level 2+ (alla fält)
+    l2_weight_type: float = 0.5
+    l2_weight_title: float = 0.3
+    l2_weight_desc: float = 0.2
+
     def get_db_url(self) -> str:
         return self.db_url or ""
 
@@ -291,32 +301,58 @@ class HierarchicalClassifier:
         self.model = embedding_model
         self.max_levels = 4
 
+    def _get_product_fields(self, product: dict) -> tuple[str, str, str]:
+        """Extrahera produktfält."""
+        product_type = (product.get('product_type', '') or '').strip()
+        title = (product.get('title', '') or '').strip()
+        description = ((product.get('description', '') or '')[:300]).strip()
+        return product_type, title, description
+
     def _build_product_text(self, product: dict, level: int = 1) -> str:
-        """Bygg produkttext för embedding."""
-        product_type = product.get('product_type', '') or ''
-        title = product.get('title', '') or ''
-        description = (product.get('description', '') or '')[:300]
+        """Bygg produkttext för embedding (fallback om weighted inte används)."""
+        product_type, title, description = self._get_product_fields(product)
 
         if level == 1:
-            # Level 1: Fokusera på product_type (mest pålitlig signal)
-            # Repetera product_type för extra vikt, skippa description (har brus)
-            parts = []
-            if product_type:
-                parts.append(product_type)
-                parts.append(product_type)  # Dubbel vikt
-            if title:
-                parts.append(title)
+            parts = [p for p in [product_type, title] if p]
             return ' | '.join(parts) if parts else 'unknown'
         else:
-            # Level 2+: Använd allt för finare matching
-            parts = []
-            if product_type:
-                parts.append(product_type)
-            if title:
-                parts.append(title)
-            if description:
-                parts.append(description)
+            parts = [p for p in [product_type, title, description] if p]
             return ' | '.join(parts) if parts else 'unknown'
+
+    def encode_products_weighted(self, products: list[dict],
+                                  weight_type: float = 0.5,
+                                  weight_title: float = 0.3,
+                                  weight_desc: float = 0.2) -> torch.Tensor:
+        """
+        Skapa viktade embeddings för produkter.
+
+        Varje fält (product_type, title, description) får sin egen embedding,
+        sedan kombineras de med vikter för bättre precision.
+        """
+        # Extrahera fält
+        types = []
+        titles = []
+        descs = []
+        for p in products:
+            pt, t, d = self._get_product_fields(p)
+            types.append(pt if pt else 'unknown')
+            titles.append(t if t else 'unknown')
+            descs.append(d if d else 'unknown')
+
+        # Skapa separata embeddings
+        emb_types = self.model.encode(types, prefix="query: ")
+        emb_titles = self.model.encode(titles, prefix="query: ")
+        emb_descs = self.model.encode(descs, prefix="query: ")
+
+        # Viktad kombination
+        combined = (weight_type * emb_types +
+                   weight_title * emb_titles +
+                   weight_desc * emb_descs)
+
+        # Normalisera för cosine similarity
+        combined = torch.nn.functional.normalize(combined, p=2, dim=1)
+
+        return combined
 
     def _match_to_categories(self, product_embeddings: torch.Tensor, categories: list[dict],
                              cat_embeddings: torch.Tensor) -> list[tuple[dict, float]]:
@@ -353,9 +389,13 @@ class HierarchicalClassifier:
                 gender_groups[gender] = []
             gender_groups[gender].append(i)
 
-        # Skapa embeddings för Level 1 (alla produkter)
-        texts_l1 = [self._build_product_text(p, level=1) for p in products]
-        product_emb_l1 = self.model.encode(texts_l1, prefix="query: ")
+        # Skapa VIKTADE embeddings för Level 1 (använd config-vikter)
+        product_emb_l1 = self.encode_products_weighted(
+            products,
+            weight_type=self.config.l1_weight_type,
+            weight_title=self.config.l1_weight_title,
+            weight_desc=self.config.l1_weight_desc
+        )
 
         # Matcha varje gender-grupp mot sina kategorier
         for gender, indices in gender_groups.items():
@@ -382,9 +422,13 @@ class HierarchicalClassifier:
                     results[idx]['level_1_conf'] = round(conf, 4)
 
         # === LEVEL 2, 3, 4 ===
-        # För djupare nivåer: använd full produkttext (inkl. description)
-        texts_full = [self._build_product_text(p, level=2) for p in products]
-        product_emb_full = self.model.encode(texts_full, prefix="query: ")
+        # För djupare nivåer: använd VIKTADE embeddings (använd config-vikter)
+        product_emb_full = self.encode_products_weighted(
+            products,
+            weight_type=self.config.l2_weight_type,
+            weight_title=self.config.l2_weight_title,
+            weight_desc=self.config.l2_weight_desc
+        )
 
         for level in [2, 3, 4]:
             prev_level = level - 1
@@ -502,15 +546,29 @@ async def main():
     parser.add_argument("--batch-size", "-b", type=int, default=1024)
     parser.add_argument("--refresh-cache", action="store_true", help="Tvinga omladdning från DB")
     parser.add_argument("--min-confidence", type=float, default=0.5)
+    # Vikter för embedding (L1 = Level 1, L2 = Level 2+)
+    parser.add_argument("--l1-weight-type", type=float, default=0.6, help="Vikt för product_type i Level 1")
+    parser.add_argument("--l1-weight-title", type=float, default=0.4, help="Vikt för title i Level 1")
+    parser.add_argument("--l2-weight-type", type=float, default=0.5, help="Vikt för product_type i Level 2+")
+    parser.add_argument("--l2-weight-title", type=float, default=0.3, help="Vikt för title i Level 2+")
+    parser.add_argument("--l2-weight-desc", type=float, default=0.2, help="Vikt för description i Level 2+")
     args = parser.parse_args()
 
     config = Config()
     config.batch_size = args.batch_size
     config.min_confidence = args.min_confidence
+    config.l1_weight_type = args.l1_weight_type
+    config.l1_weight_title = args.l1_weight_title
+    config.l1_weight_desc = 0.0  # Alltid 0 för Level 1
+    config.l2_weight_type = args.l2_weight_type
+    config.l2_weight_title = args.l2_weight_title
+    config.l2_weight_desc = args.l2_weight_desc
 
     logger.info("=" * 60)
     logger.info("HIERARKISK KATEGORI-KLASSIFICERING")
     logger.info("=" * 60)
+    logger.info(f"Vikter L1: type={config.l1_weight_type}, title={config.l1_weight_title}, desc={config.l1_weight_desc}")
+    logger.info(f"Vikter L2+: type={config.l2_weight_type}, title={config.l2_weight_title}, desc={config.l2_weight_desc}")
 
     # === Ladda kategorier (cache eller DB) ===
     category_cache = CategoryCache()
