@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local files
+outputs/
+inputs/*.csv
+*.log
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Misc
+README.md
+*.md

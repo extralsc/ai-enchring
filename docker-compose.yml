@@ -1,0 +1,50 @@
+# =============================================================================
+# Product Enrichment Pipeline - Docker Compose
+# =============================================================================
+#
+# Usage:
+#   docker-compose run --rm app python beta.py
+#   docker-compose run --rm app python beta2.py
+#   docker-compose run --rm app python app.py
+#
+# Or start interactive shell:
+#   docker-compose run --rm app bash
+# =============================================================================
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: product-enrichment:latest
+
+    # GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Environment variables
+    env_file:
+      - .env
+
+    # Mount volumes
+    volumes:
+      - ./inputs:/app/inputs
+      - ./outputs:/app/outputs
+      # Cache Hugging Face models (persist between runs)
+      - hf_cache:/root/.cache/huggingface
+
+    # Keep container running for development
+    stdin_open: true
+    tty: true
+
+    # Working directory
+    working_dir: /app
+
+# Persistent volume for model cache
+volumes:
+  hf_cache:

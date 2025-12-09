@@ -1,0 +1,81 @@
+#!/bin/bash
+# =============================================================================
+# Product Enrichment Pipeline - Quick Run Script
+# =============================================================================
+#
+# Usage:
+#   ./run.sh beta              # Run beta.py (embedding only)
+#   ./run.sh beta2             # Run beta2.py (RAG + LLM)
+#   ./run.sh app               # Run app.py (full pipeline)
+#   ./run.sh shell             # Interactive shell
+#   ./run.sh build             # Build Docker image
+# =============================================================================
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check for .env file
+if [ ! -f .env ]; then
+    echo -e "${RED}Error: .env file not found!${NC}"
+    echo "Create one from the example:"
+    echo "  cp .env.example .env"
+    echo "  nano .env  # Add your DATABASE_URL"
+    exit 1
+fi
+
+# Check for inputs directory
+if [ ! -d inputs ]; then
+    mkdir -p inputs
+    echo -e "${YELLOW}Created inputs/ directory. Add your CSV files there.${NC}"
+fi
+
+# Check for outputs directory
+if [ ! -d outputs ]; then
+    mkdir -p outputs
+fi
+
+case "$1" in
+    build)
+        echo -e "${GREEN}Building Docker image...${NC}"
+        docker-compose build
+        ;;
+    beta)
+        echo -e "${GREEN}Running beta.py (Embedding classification)...${NC}"
+        docker-compose run --rm app python beta.py "${@:2}"
+        ;;
+    beta2)
+        echo -e "${GREEN}Running beta2.py (RAG + LLM classification)...${NC}"
+        docker-compose run --rm app python beta2.py "${@:2}"
+        ;;
+    app)
+        echo -e "${GREEN}Running app.py (Full pipeline)...${NC}"
+        docker-compose run --rm app python app.py "${@:2}"
+        ;;
+    shell)
+        echo -e "${GREEN}Starting interactive shell...${NC}"
+        docker-compose run --rm app bash
+        ;;
+    *)
+        echo "Product Enrichment Pipeline"
+        echo ""
+        echo "Usage: ./run.sh <command> [options]"
+        echo ""
+        echo "Commands:"
+        echo "  build     Build Docker image"
+        echo "  beta      Run embedding-only classification (fast)"
+        echo "  beta2     Run RAG + LLM classification (accurate)"
+        echo "  app       Run full pipeline"
+        echo "  shell     Start interactive shell"
+        echo ""
+        echo "Examples:"
+        echo "  ./run.sh build"
+        echo "  ./run.sh beta --input inputs/products.csv"
+        echo "  ./run.sh beta2 --top-k 5"
+        echo "  ./run.sh shell"
+        ;;
+esac
