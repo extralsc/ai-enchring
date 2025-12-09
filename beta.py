@@ -56,7 +56,7 @@ CACHE_DIR = BASE_DIR / "cache"
 class Config:
     """Konfiguration för A100 40GB VRAM."""
     db_url: str = field(default_factory=lambda: os.getenv('DATABASE_URL', ''))
-    model_name: str = "intfloat/multilingual-e5-large"
+    model_name: str = "BAAI/bge-m3"  # Bättre cross-lingual än E5
     batch_size: int = 1024
     max_length: int = 256
     min_confidence: float = 0.5  # Minimum confidence för match
@@ -234,11 +234,15 @@ class EmbeddingModel:
         sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
         return sum_embeddings / sum_mask
 
-    def encode(self, texts: list[str], prefix: str = "query: ") -> torch.Tensor:
+    def encode(self, texts: list[str], prefix: str = "") -> torch.Tensor:
         """Koda texter till embeddings."""
         self.load()
 
-        prefixed = [f"{prefix}{t}" for t in texts]
+        # BGE-M3 behöver inga prefixes, E5 behöver "query: " / "passage: "
+        if prefix:
+            prefixed = [f"{prefix}{t}" for t in texts]
+        else:
+            prefixed = texts
         all_emb = []
 
         for i in range(0, len(prefixed), self.config.batch_size):
@@ -281,7 +285,7 @@ class EmbeddingModel:
         else:
             names = [cat['name'] for cat in categories]
 
-        embeddings = self.encode(names, prefix="passage: ")
+        embeddings = self.encode(names)  # Ingen prefix för BGE-M3
 
         self.category_embeddings_cache[cache_key] = (embeddings, categories)
         return embeddings, categories
@@ -342,10 +346,10 @@ class HierarchicalClassifier:
             titles.append(t if t else 'unknown')
             descs.append(d if d else 'unknown')
 
-        # Skapa separata embeddings
-        emb_types = self.model.encode(types, prefix="query: ")
-        emb_titles = self.model.encode(titles, prefix="query: ")
-        emb_descs = self.model.encode(descs, prefix="query: ")
+        # Skapa separata embeddings (ingen prefix för BGE-M3)
+        emb_types = self.model.encode(types)
+        emb_titles = self.model.encode(titles)
+        emb_descs = self.model.encode(descs)
 
         # Viktad kombination
         combined = (weight_type * emb_types +
@@ -555,6 +559,8 @@ async def main():
     parser.add_argument("--batch-size", "-b", type=int, default=1024)
     parser.add_argument("--refresh-cache", action="store_true", help="Tvinga omladdning från DB")
     parser.add_argument("--min-confidence", type=float, default=0.5)
+    parser.add_argument("--model", "-m", type=str, default="BAAI/bge-m3",
+                       help="Embedding model (default: BAAI/bge-m3)")
     # Vikter för embedding (L1 = Level 1, L2 = Level 2+)
     parser.add_argument("--l1-weight-type", type=float, default=0.6, help="Vikt för product_type i Level 1")
     parser.add_argument("--l1-weight-title", type=float, default=0.4, help="Vikt för title i Level 1")
@@ -564,6 +570,7 @@ async def main():
     args = parser.parse_args()
 
     config = Config()
+    config.model_name = args.model
     config.batch_size = args.batch_size
     config.min_confidence = args.min_confidence
     config.l1_weight_type = args.l1_weight_type
@@ -576,6 +583,7 @@ async def main():
     logger.info("=" * 60)
     logger.info("HIERARKISK KATEGORI-KLASSIFICERING")
     logger.info("=" * 60)
+    logger.info(f"Modell: {config.model_name}")
     logger.info(f"Vikter L1: type={config.l1_weight_type}, title={config.l1_weight_title}, desc={config.l1_weight_desc}")
     logger.info(f"Vikter L2+: type={config.l2_weight_type}, title={config.l2_weight_title}, desc={config.l2_weight_desc}")
 
