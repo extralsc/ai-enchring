@@ -273,7 +273,7 @@ class EmbeddingModel:
             for cat in categories:
                 children = category_cache.get_children(cat['id'])
                 if children:
-                    child_names = [c['name'] for c in children[:8]]  # Max 8 barn
+                    child_names = [c['name'] for c in children]  # Alla barn, ingen limit
                     enriched = f"{cat['name']}: {', '.join(child_names)}"
                     names.append(enriched)
                 else:
