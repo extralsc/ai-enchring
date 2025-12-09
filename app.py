@@ -1154,12 +1154,8 @@ class TaxonomyMapper:
                         if last_word in self.ENGLISH_TO_SWEDISH:
                             parts.append(self.ENGLISH_TO_SWEDISH[last_word])
 
-            # 4. Detected from image - ONLY if confidence is above threshold
-            if d and conf >= MIN_DETECTION_CONFIDENCE:
-                parts.append(d)
-                # Add Swedish translation for detected category
-                if d.lower() in self.ENGLISH_TO_SWEDISH:
-                    parts.append(self.ENGLISH_TO_SWEDISH[d.lower()])
+            # 4. SKIP image detection - unreliable (wrong images from suppliers)
+            # Only use text-based signals: product_type, description, title, google_category
 
             # 5. Google category - only use last segment if specific enough
             if g and '>' in g:
