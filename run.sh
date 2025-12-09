@@ -56,6 +56,10 @@ case "$1" in
         echo -e "${GREEN}Running beta3.py (Embedding + Cross-encoder re-ranking)...${NC}"
         docker compose run --rm app python beta3.py "${@:2}"
         ;;
+    fashion)
+        echo -e "${GREEN}Running fashion_beta.py (FashionSigLIP classification)...${NC}"
+        docker compose run --rm app python fashion_beta.py "${@:2}"
+        ;;
     app)
         echo -e "${GREEN}Running app.py (Full pipeline)...${NC}"
         docker compose run --rm app python app.py "${@:2}"
@@ -71,9 +75,10 @@ case "$1" in
         echo ""
         echo "Commands:"
         echo "  build     Build Docker image"
-        echo "  beta      Run embedding-only classification (fast)"
+        echo "  beta      Run embedding-only classification (BGE-M3, fast)"
         echo "  beta2     Run RAG + LLM classification (most accurate, slow)"
-        echo "  beta3     Run embedding + cross-encoder re-ranking (accurate, medium speed)"
+        echo "  beta3     Run embedding + cross-encoder re-ranking (accurate, medium)"
+        echo "  fashion   Run FashionSigLIP classification (fashion-optimized)"
         echo "  app       Run full pipeline"
         echo "  shell     Start interactive shell"
         echo ""
@@ -82,6 +87,7 @@ case "$1" in
         echo "  ./run.sh beta --input inputs/products.csv"
         echo "  ./run.sh beta2 --top-k 5"
         echo "  ./run.sh beta3 --top-k 10"
+        echo "  ./run.sh fashion --input inputs/products.csv"
         echo "  ./run.sh shell"
         ;;
 esac
