@@ -48,19 +48,19 @@ load_dotenv()
 
 @dataclass
 class Config:
-    """Pipeline configuration - MAXIMIZED for A10 GPU (24GB VRAM, 30 vCPUs, 226GB RAM)."""
+    """Pipeline configuration - OPTIMIZED for A100 GPU (40GB VRAM, 30 vCPUs, 220GB RAM)."""
     # Database
     db_url: str = field(default_factory=lambda: os.getenv('DATABASE_URL', ''))
 
-    # Processing - OPTIMIZED for A10 (23GB VRAM)
-    batch_size: int = 512  # Image processing batch (reduced to avoid OOM)
-    max_concurrent_downloads: int = 1000  # Max async downloads
+    # Processing - OPTIMIZED for A100 (40GB VRAM, 30 vCPUs)
+    batch_size: int = 1024  # Larger batches for A100
+    max_concurrent_downloads: int = 1500  # Max async downloads
     download_timeout: int = 10  # Faster timeout
     use_fp16: bool = True
-    num_workers: int = 16  # CPU workers for image preprocessing
+    num_workers: int = 24  # CPU workers for image preprocessing
 
     # Classification batch sizes
-    bart_batch_size: int = 128  # Zero-shot classification batch
+    bart_batch_size: int = 256  # Larger batches for A100
 
     # Speed vs accuracy tradeoff
     # Zero-shot category is SLOW (~80 labels) but accurate
@@ -75,11 +75,11 @@ class Config:
     # LLM-based category matching - uses a local LLM for accurate understanding
     # LLM understands that "Jacket" = "Jacka" = "Ytterplagg" (multilingual semantics)
     use_llm_category: bool = True  # Enable for best accuracy
-    llm_model: str = "Qwen/Qwen2.5-3B-Instruct"  # Good multilingual LLM
+    llm_model: str = "Qwen/Qwen2.5-7B-Instruct"  # Larger model = better accuracy (A100 40GB)
     use_vllm: bool = True  # Use vLLM for faster, stable inference
     llm_confidence_threshold: float = 1.0  # Use LLM for ALL products (LLM knows Bag=Väska)
 
-    # Models - OPTIMIZED for A10's 24GB VRAM
+    # Models - OPTIMIZED for A100 40GB VRAM
     # FashionSigLIP outperforms FashionCLIP on fashion benchmarks
     fashion_model: str = "Marqo/marqo-fashionSigLIP"
     # Larger multilingual model (~1GB) - better accuracy for Swedish categories
@@ -736,11 +736,9 @@ class TaxonomyMapper:
         self.category_embeddings_by_gender = {}  # gender_id -> embeddings tensor
 
         # Load WikiDict dictionary for word-level translations (fast, for enrichment)
+        # LLM handles multilingual matching (Jacket=Jacka), so translator not needed
         self.dictionary = get_dictionary()
         self.dictionary.load()
-
-        # Load GPT-SW3 translator for high-quality Swedish↔English translation
-        self.translator = get_translator()
 
     def set_local_colors(self, colors: list[dict]):
         self.local_colors = colors
