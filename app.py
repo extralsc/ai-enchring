@@ -21,7 +21,7 @@ import aiohttp
 import asyncpg
 import numpy as np
 import torch
-from datasets import Dataset
+# Note: Dataset not needed - pipeline handles lists directly
 from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm
@@ -50,22 +50,23 @@ class Config:
     # Database
     db_url: str = field(default_factory=lambda: os.getenv('DATABASE_URL', ''))
 
-    # Processing - FULLY UTILIZING A10
-    batch_size: int = 512  # Image processing batch (was 256)
-    max_concurrent_downloads: int = 500  # Async downloads (was 200)
+    # Processing - FULLY UTILIZING A10 (23GB VRAM!)
+    batch_size: int = 768  # Image processing batch - INCREASED for 23GB
+    max_concurrent_downloads: int = 1000  # Max async downloads
     download_timeout: int = 10  # Faster timeout
     use_fp16: bool = True
-    num_workers: int = 16  # CPU workers (was 8)
+    num_workers: int = 24  # Use more of 30 vCPUs
 
-    # BART classifier batch sizes
-    bart_batch_size: int = 64  # For zero-shot classification (was 16-32)
+    # Classification batch sizes - INCREASED for 23GB VRAM
+    bart_batch_size: int = 128  # Zero-shot classification batch (was 64)
 
     # Models - LARGER/BETTER for A10's 24GB VRAM
-    # Fashion-specific model - 57% better than generic CLIP for clothing
-    fashion_model: str = "Marqo/marqo-fashionSigLIP"
-    # Larger multilingual model (~1GB vs 500MB) - better accuracy for Swedish
+    # FashionCLIP (ViT-L-14) is larger and 7% more accurate than FashionSigLIP (ViT-B-16)
+    # Uses ~3GB vs ~1.5GB - better results, still fits easily
+    fashion_model: str = "Marqo/marqo-fashionCLIP"
+    # Larger multilingual model (~1GB) - better accuracy for Swedish categories
     sentence_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-    # DeBERTa is more accurate than BART for zero-shot (~2GB vs 1.5GB)
+    # DeBERTa-v3-large is most accurate zero-shot classifier (~2GB)
     zero_shot_model: str = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
 
     # Prompts for CLIP
@@ -213,27 +214,37 @@ class FastImageDownloader:
 
 
 # =============================================================================
-# FASHION IMAGE PROCESSOR - Using Marqo FashionSigLIP
+# FASHION IMAGE PROCESSOR - Using Marqo FashionCLIP (ViT-L-14)
 # =============================================================================
 
 class FashionImageProcessor:
-    """Fashion-specific image processor using Marqo FashionSigLIP model.
+    """Fashion-specific image processor using Marqo FashionCLIP model.
 
-    57% better recall than generic CLIP for fashion/clothing detection.
+    FashionCLIP (ViT-L-14) is 7% more accurate than FashionSigLIP (ViT-B-16).
+    Uses ~3GB VRAM vs ~1.5GB, but we have 23GB available.
     Trained specifically on fashion colors, categories, materials, and styles.
     """
 
     def __init__(self, config: Config):
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"FashionSigLIP using device: {self.device}")
+        logger.info(f"FashionCLIP using device: {self.device}")
 
         # Load fashion-specific model using open_clip
         logger.info(f"Loading {config.fashion_model}...")
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            f'hf-hub:{config.fashion_model}'
-        )
-        self.tokenizer = open_clip.get_tokenizer(f'hf-hub:{config.fashion_model}')
+        try:
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+                f'hf-hub:{config.fashion_model}'
+            )
+            self.tokenizer = open_clip.get_tokenizer(f'hf-hub:{config.fashion_model}')
+        except Exception as e:
+            # Fallback to FashionSigLIP if FashionCLIP fails
+            logger.warning(f"Failed to load {config.fashion_model}: {e}")
+            logger.info("Falling back to Marqo/marqo-fashionSigLIP...")
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+                'hf-hub:Marqo/marqo-fashionSigLIP'
+            )
+            self.tokenizer = open_clip.get_tokenizer('hf-hub:Marqo/marqo-fashionSigLIP')
 
         # Optimize for speed
         self.model = self.model.to(self.device)
@@ -635,27 +646,32 @@ class CategoryClassifier:
                 parts.append(ctx['description'][:150])
             texts.append(' '.join(parts) if parts else 'unknown product')
 
-        # Use Dataset for efficient GPU batching (fixes sequential warning)
-        from datasets import Dataset as HFDataset
-
-        dataset = HFDataset.from_dict({"text": texts})
-
-        # Run classification on full dataset
+        # Run classification with batching
         logger.info(f"Classifying {len(texts)} products into {len(self.category_labels)} categories...")
-        outputs = []
-        for out in tqdm(
-            self.classifier(dataset["text"], self.category_labels, batch_size=self.config.bart_batch_size),
-            total=len(texts),
-            desc="Classifying categories",
-            leave=False
-        ):
-            outputs.append(out)
+        outputs = list(self.classifier(
+            texts,
+            self.category_labels,
+            batch_size=self.config.bart_batch_size
+        ))
 
-        # Build results
+        # Debug: show first result format
+        if outputs:
+            logger.debug(f"Category classifier output format: {type(outputs[0])}, sample: {outputs[0]}")
+
+        # Build results - handle both dict and list output formats
         results = []
         for i, out in enumerate(outputs):
-            best_label = out['labels'][0]
-            best_score = out['scores'][0]
+            # Handle different output formats
+            if isinstance(out, dict):
+                best_label = out['labels'][0]
+                best_score = out['scores'][0]
+            elif isinstance(out, list) and len(out) > 0:
+                best_label = out[0].get('label', out[0].get('labels', ['unknown'])[0])
+                best_score = out[0].get('score', out[0].get('scores', [0.0])[0])
+            else:
+                logger.warning(f"Unexpected category classifier output: {type(out)}: {out}")
+                results.append({"id": None, "name": "unknown", "confidence": 0.0, "suggestion": None})
+                continue
 
             cat_info = self.category_map.get(best_label, {})
 
@@ -726,27 +742,35 @@ class SizeTypeClassifier:
         if not valid_texts:
             return [{"size_type": None, "confidence": 0.0} for _ in contexts]
 
-        # Use Dataset for efficient GPU batching (fixes sequential warning)
-        from datasets import Dataset as HFDataset
-        dataset = HFDataset.from_dict({"text": valid_texts})
+        # Process with batching - pass list directly to pipeline
+        results_list = list(self.classifier(
+            valid_texts,
+            self.config.size_type_labels,
+            batch_size=self.config.bart_batch_size
+        ))
 
-        # Process with optimal batching
-        results_list = []
-        for out in tqdm(
-            self.classifier(dataset["text"], self.config.size_type_labels, batch_size=self.config.bart_batch_size),
-            total=len(valid_texts),
-            desc="Classifying size types",
-            leave=False
-        ):
-            results_list.append(out)
+        # Debug: show first result format
+        if results_list:
+            logger.debug(f"Size classifier output format: {type(results_list[0])}, sample: {results_list[0]}")
 
         # Map back
         results = [{"size_type": None, "confidence": 0.0} for _ in contexts]
         for i, valid_idx in enumerate(valid_indices):
-            results[valid_idx] = {
-                "size_type": results_list[i]["labels"][0],
-                "confidence": round(results_list[i]["scores"][0], 3)
-            }
+            out = results_list[i]
+            # Handle both dict and nested list formats
+            if isinstance(out, dict):
+                results[valid_idx] = {
+                    "size_type": out["labels"][0],
+                    "confidence": round(out["scores"][0], 3)
+                }
+            elif isinstance(out, list) and len(out) > 0:
+                # Pipeline sometimes returns list of dicts
+                results[valid_idx] = {
+                    "size_type": out[0]["label"] if "label" in out[0] else out[0]["labels"][0],
+                    "confidence": round(out[0]["score"] if "score" in out[0] else out[0]["scores"][0], 3)
+                }
+            else:
+                logger.warning(f"Unexpected size classifier output: {type(out)}: {out}")
         return results
 
 
@@ -871,13 +895,18 @@ class ProductEnrichmentPipeline:
             ]
 
             # PARALLEL TASK 1: Size type classification (doesn't need images!)
-            # Now uses: title + description + product_type + google_product_category
             logger.info("Starting size type classification (parallel)...")
             size_task = asyncio.create_task(
                 asyncio.to_thread(self.size_classifier.classify_all, size_contexts)
             )
 
-            # PARALLEL TASK 2: Process images in batches
+            # PARALLEL TASK 2: Zero-shot category classification (doesn't need images!)
+            logger.info("Starting category classification (parallel)...")
+            category_task = asyncio.create_task(
+                asyncio.to_thread(self.category_classifier.classify_batch, size_contexts)
+            )
+
+            # PARALLEL TASK 3: Process images in batches
             all_clip_results = []
             async with FastImageDownloader(self.config) as downloader:
                 with tqdm(total=num_batches, desc="Processing batches", unit="batch") as pbar:
@@ -899,9 +928,11 @@ class ProductEnrichmentPipeline:
 
                 logger.info(f"Image downloads: {downloader.stats['success']} success, {downloader.stats['failed']} failed")
 
-            # Wait for size classification to complete
-            logger.info("Waiting for size classification to complete...")
+            # Wait for parallel tasks to complete
+            logger.info("Waiting for size/category classification to complete...")
             size_results = await size_task
+            zeroshot_categories = await category_task
+            logger.info("Classification tasks complete!")
 
             # Extract detected values with confidence scores
             detected_colors = [r["color"] for r in all_clip_results]
@@ -919,10 +950,6 @@ class ProductEnrichmentPipeline:
                 detected_categories, product_types, google_categories, detected_category_confidences, titles
             )
             mapped_genders = self.mapper.map_batch_genders(csv_genders)
-
-            # Zero-shot category classification using BART (much more accurate)
-            logger.info("Running zero-shot category classification...")
-            zeroshot_categories = self.category_classifier.classify_batch(size_contexts)
 
             # Enrich products
             logger.info("Enriching products...")
