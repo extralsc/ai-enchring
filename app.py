@@ -9,6 +9,7 @@ import asyncio
 import csv
 import logging
 import os
+import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -115,10 +116,161 @@ class Config:
     # Minimum confidence to consider a mapping valid (otherwise return "unknown")
     min_mapping_confidence: float = 0.5
 
+    # Common category normalization rules for suggestions
+    category_normalization: dict = field(default_factory=lambda: {
+        # Detected → Normalized suggestion (for when no local match)
+        'leggings': 'Athletic Leggings',
+        'tights': 'Athletic Tights',
+        'activewear': 'Activewear',
+        'sweater': 'Sweater',
+        'hoodie': 'Hoodie',
+        't-shirt': 'T-Shirt',
+        'jacket': 'Jacket',
+        'pants': 'Pants',
+        'jeans': 'Jeans',
+        'shorts': 'Shorts',
+        'dress': 'Dress',
+        'skirt': 'Skirt',
+        'coat': 'Coat',
+        'blazer': 'Blazer',
+        'cardigan': 'Cardigan',
+        'vest': 'Vest',
+        'shirt': 'Shirt',
+        'blouse': 'Blouse',
+        'polo': 'Polo Shirt',
+        'tank top': 'Tank Top',
+        'crop top': 'Crop Top',
+        'jumpsuit': 'Jumpsuit',
+        'romper': 'Romper',
+        'overalls': 'Overalls',
+        'underwear': 'Underwear',
+        'bra': 'Bra',
+        'socks': 'Socks',
+        'shoes': 'Shoes',
+        'sneakers': 'Sneakers',
+        'boots': 'Boots',
+        'sandals': 'Sandals',
+        'heels': 'Heels',
+        'flats': 'Flats',
+        'loafers': 'Loafers',
+        'bag': 'Bag',
+        'backpack': 'Backpack',
+        'purse': 'Purse',
+        'wallet': 'Wallet',
+        'belt': 'Belt',
+        'scarf': 'Scarf',
+        'hat': 'Hat',
+        'gloves': 'Gloves',
+        'swimwear': 'Swimwear',
+        'bikini': 'Bikini',
+        'sports bra': 'Sports Bra',
+        'pajamas': 'Pajamas',
+        'robe': 'Robe',
+        'lingerie': 'Lingerie',
+    })
+
     def get_db_url(self) -> str:
         if self.db_url:
             return self.db_url
         return ""
+
+
+# =============================================================================
+# BILINGUAL DICTIONARY - WikiDict Swedish↔English
+# =============================================================================
+
+class BilingualDictionary:
+    """Fast Swedish↔English dictionary using WikiDict SQLite databases.
+
+    Provides word-level translations for better cross-language category matching.
+    ~70K entries in each direction, covers most fashion terminology.
+    """
+
+    def __init__(self, dict_dir: str = "dictionaries"):
+        self.dict_dir = Path(dict_dir)
+        self.sv_en = {}  # Swedish → English
+        self.en_sv = {}  # English → Swedish
+        self._loaded = False
+
+    def load(self):
+        """Load dictionaries into memory for fast lookup."""
+        if self._loaded:
+            return
+
+        sv_en_path = self.dict_dir / "sv-en.sqlite3"
+        en_sv_path = self.dict_dir / "en-sv.sqlite3"
+
+        if sv_en_path.exists():
+            conn = sqlite3.connect(str(sv_en_path))
+            cursor = conn.cursor()
+            cursor.execute("SELECT written_rep, trans_list FROM simple_translation")
+            for word, translations in cursor.fetchall():
+                # Store first translation (most common) + all alternatives
+                self.sv_en[word.lower()] = translations.split(" | ")[0] if translations else ""
+            conn.close()
+            logger.info(f"Loaded {len(self.sv_en)} Swedish→English translations")
+        else:
+            logger.warning(f"Swedish→English dictionary not found: {sv_en_path}")
+
+        if en_sv_path.exists():
+            conn = sqlite3.connect(str(en_sv_path))
+            cursor = conn.cursor()
+            cursor.execute("SELECT written_rep, trans_list FROM simple_translation")
+            for word, translations in cursor.fetchall():
+                self.en_sv[word.lower()] = translations.split(" | ")[0] if translations else ""
+            conn.close()
+            logger.info(f"Loaded {len(self.en_sv)} English→Swedish translations")
+        else:
+            logger.warning(f"English→Swedish dictionary not found: {en_sv_path}")
+
+        self._loaded = True
+
+    def translate_sv_to_en(self, word: str) -> str:
+        """Translate Swedish word to English. Returns empty string if not found."""
+        return self.sv_en.get(word.lower().strip(), "")
+
+    def translate_en_to_sv(self, word: str) -> str:
+        """Translate English word to Swedish. Returns empty string if not found."""
+        return self.en_sv.get(word.lower().strip(), "")
+
+    def enrich_text(self, text: str) -> str:
+        """Enrich text with translations in both directions.
+
+        For each word, if a translation exists, append it.
+        This helps the multilingual model match across languages.
+        """
+        if not self._loaded:
+            self.load()
+
+        words = text.lower().split()
+        enriched_words = list(words)  # Keep original words
+
+        for word in words:
+            # Clean word (remove punctuation)
+            clean_word = word.strip(".,!?()[]{}\"'")
+
+            # Try Swedish → English
+            en_trans = self.sv_en.get(clean_word, "")
+            if en_trans:
+                enriched_words.append(en_trans)
+
+            # Try English → Swedish
+            sv_trans = self.en_sv.get(clean_word, "")
+            if sv_trans:
+                enriched_words.append(sv_trans)
+
+        return " ".join(enriched_words)
+
+
+# Global dictionary instance (lazy loaded)
+_dictionary = None
+
+def get_dictionary() -> BilingualDictionary:
+    """Get or create the global dictionary instance."""
+    global _dictionary
+    if _dictionary is None:
+        _dictionary = BilingualDictionary()
+    return _dictionary
 
 
 # =============================================================================
@@ -320,7 +472,7 @@ class FashionImageProcessor:
         valid_images = [images[i] for i in valid_indices]
 
         if not valid_images:
-            return [{"color": None, "category": None, "color_conf": 0, "category_conf": 0} for _ in images]
+            return [{"color": None, "color_id": None, "category": None, "color_conf": 0, "category_conf": 0} for _ in images]
 
         # PARALLEL preprocessing using ThreadPoolExecutor (CPU-bound)
         with ThreadPoolExecutor(max_workers=self.config.num_workers) as executor:
@@ -361,46 +513,221 @@ class FashionImageProcessor:
 class TaxonomyMapper:
     """Maps values to local taxonomy using sentence embeddings."""
 
-    # Swedish → English translations for common clothing categories
+    # Bidirectional Swedish ↔ English translations for clothing categories
+    # Used to enrich both queries AND category embeddings for better cross-language matching
     SWEDISH_TO_ENGLISH = {
+        # Outerwear
         'jackor': 'jackets coats outerwear',
+        'jacka': 'jacket coat outerwear',
+        'kappa': 'coat overcoat',
+        'kappor': 'coats overcoats',
+        'rock': 'coat overcoat',
+        'dunjacka': 'down jacket puffer jacket',
+        'skinnjacka': 'leather jacket',
+        'regnjacka': 'rain jacket raincoat',
+        'vindjacka': 'windbreaker wind jacket',
+        'fleecejacka': 'fleece jacket',
+        'softshell': 'softshell jacket',
+
+        # Pants/Bottoms
         'byxor': 'pants trousers',
         'jeans': 'jeans denim',
         'shorts': 'shorts',
-        'klänningar': 'dresses',
         'kjolar': 'skirts',
+        'kjol': 'skirt',
+        'chinos': 'chinos khakis',
+        'joggers': 'joggers sweatpants',
+        'mjukisbyxor': 'sweatpants joggers lounge pants',
+        'kostymbyxor': 'dress pants suit pants trousers',
+        'cargobyxor': 'cargo pants',
+
+        # Dresses
+        'klänningar': 'dresses',
+        'klänning': 'dress',
+        'maxiklänning': 'maxi dress',
+        'miniklänning': 'mini dress',
+        'midiklänning': 'midi dress',
+
+        # Tops
         'toppar': 'tops blouses shirts',
+        'topp': 'top blouse',
         't-shirts': 't-shirts tees',
-        'skjortor': 'shirts button-up',
-        'tröjor': 'sweaters knitwear pullovers',
-        'sweatshirts': 'sweatshirts hoodies',
-        'kavajer': 'blazers suit jackets',
+        't-shirt': 't-shirt tee',
+        'tröja': 'sweater pullover jumper',
+        'tröjor': 'sweaters pullovers jumpers knitwear',
+        'skjortor': 'shirts button-up dress shirts',
+        'skjorta': 'shirt button-up',
+        'blus': 'blouse',
+        'blusar': 'blouses',
+        'linne': 'tank top singlet vest',
+        'linnen': 'tank tops singlets',
+        'polotröja': 'polo shirt polo',
+        'sweatshirt': 'sweatshirt crew neck',
+        'sweatshirts': 'sweatshirts hoodies crew necks',
+        'hoodie': 'hoodie hooded sweatshirt',
+        'huvtröja': 'hoodie hooded sweatshirt',
+        'kofta': 'cardigan',
+        'koftor': 'cardigans',
+        'stickad': 'knitted knitwear knit',
+
+        # Suits/Formal
+        'kavajer': 'blazers suit jackets sport coats',
+        'kavaj': 'blazer suit jacket sport coat',
         'kostymer': 'suits',
-        'underkläder': 'underwear lingerie',
+        'kostym': 'suit',
+        'väst': 'vest waistcoat',
+        'västar': 'vests waistcoats',
+
+        # Underwear/Intimates
+        'underkläder': 'underwear lingerie intimates',
+        'trosor': 'panties briefs underwear',
+        'kalsonger': 'boxers briefs underwear mens',
+        'bh': 'bra bras',
+        'sport-bh': 'sports bra athletic bra',
+
+        # Socks/Hosiery
         'strumpor': 'socks hosiery',
-        'strumpbyxor': 'pantyhose stockings hosiery',  # NOT athletic tights!
+        'strumpbyxor': 'pantyhose stockings tights hosiery',  # Traditional tights/pantyhose
+        'ankelstrumpor': 'ankle socks',
+        'knästrumpor': 'knee socks knee-high socks',
+
+        # Athletic/Activewear - IMPORTANT: distinguish from pantyhose!
+        'tights': 'athletic tights leggings running tights workout tights sportswear',
+        'leggings': 'leggings athletic tights yoga pants workout pants',
+        'träningsbyxor': 'training pants workout pants athletic pants',
+        'träningskläder': 'activewear sportswear athletic wear workout clothes',
+        'träningströja': 'athletic shirt workout top sports top',
+        'löparkläder': 'running clothes running gear',
+        'yogakläder': 'yoga clothes yoga wear',
+
+        # Footwear
         'skor': 'shoes footwear',
-        'sneakers': 'sneakers trainers',
+        'sneakers': 'sneakers trainers athletic shoes',
         'stövlar': 'boots',
+        'stövel': 'boot',
+        'stövletter': 'ankle boots booties',
         'sandaler': 'sandals',
-        'väskor': 'bags handbags',
+        'sandal': 'sandal',
+        'klackskor': 'heels high heels pumps',
+        'loafers': 'loafers slip-ons',
+        'ballerina': 'ballet flats flats',
+        'träningsskor': 'athletic shoes training shoes sneakers',
+        'löparskor': 'running shoes',
+        'vandringsskor': 'hiking shoes hiking boots',
+        'tofflor': 'slippers',
+
+        # Bags/Accessories
+        'väskor': 'bags handbags purses',
+        'väska': 'bag handbag purse',
+        'ryggsäck': 'backpack rucksack',
+        'ryggsäckar': 'backpacks rucksacks',
+        'axelväska': 'shoulder bag',
+        'handväska': 'handbag purse',
+        'plånbok': 'wallet',
+        'plånböcker': 'wallets',
         'accessoarer': 'accessories',
         'bälten': 'belts',
+        'bälte': 'belt',
         'halsdukar': 'scarves',
+        'halsduk': 'scarf',
+        'sjal': 'shawl wrap',
         'mössor': 'hats caps beanies',
+        'mössa': 'hat cap beanie',
+        'keps': 'cap baseball cap',
         'handskar': 'gloves',
-        'badkläder': 'swimwear bikinis',
-        'träningskläder': 'activewear sportswear tights leggings',
-        'pyjamas': 'pajamas sleepwear',
-        'kläder': 'clothing apparel',
-        'herr': 'men mens male',
-        'dam': 'women womens female',
-        'barn': 'kids children',
-        'man': 'men mens male man',
-        'woman': 'women womens female woman',
-        'tights': 'athletic tights leggings running pants sportswear',  # NOT pantyhose!
-        'leggings': 'leggings tights athletic pants',
-        'kjol': 'skirt',
+        'vantar': 'mittens',
+        'solglasögon': 'sunglasses',
+
+        # Swimwear
+        'badkläder': 'swimwear swimsuits bathing suits',
+        'baddräkt': 'swimsuit one-piece',
+        'bikini': 'bikini two-piece',
+        'badbyxor': 'swim trunks swim shorts',
+        'badshorts': 'swim shorts board shorts',
+
+        # Sleepwear
+        'pyjamas': 'pajamas sleepwear pjs',
+        'nattlinne': 'nightgown nightdress',
+        'morgonrock': 'robe bathrobe',
+
+        # General
+        'kläder': 'clothing apparel clothes',
+        'herr': 'men mens male man',
+        'dam': 'women womens female woman ladies',
+        'barn': 'kids children boys girls',
+        'flicka': 'girl girls',
+        'pojke': 'boy boys',
+        'baby': 'baby infant',
+        'nyfödd': 'newborn baby',
+        'unisex': 'unisex gender-neutral',
+    }
+
+    # English → Swedish (reverse mappings for English supplier data)
+    ENGLISH_TO_SWEDISH = {
+        'jacket': 'jacka jackor',
+        'coat': 'kappa rock',
+        'pants': 'byxor',
+        'trousers': 'byxor kostymbyxor',
+        'jeans': 'jeans',
+        'shorts': 'shorts',
+        'skirt': 'kjol kjolar',
+        'dress': 'klänning klänningar',
+        't-shirt': 't-shirt t-shirts',
+        'tee': 't-shirt',
+        'shirt': 'skjorta skjortor',
+        'blouse': 'blus blusar',
+        'sweater': 'tröja tröjor stickad',
+        'pullover': 'tröja',
+        'jumper': 'tröja',
+        'cardigan': 'kofta koftor',
+        'hoodie': 'hoodie huvtröja',
+        'sweatshirt': 'sweatshirt tröja',
+        'blazer': 'kavaj kavajer',
+        'suit': 'kostym kostymer',
+        'vest': 'väst',
+        'tank top': 'linne',
+        'polo': 'polotröja',
+        'underwear': 'underkläder',
+        'bra': 'bh',
+        'sports bra': 'sport-bh',
+        'panties': 'trosor',
+        'boxers': 'kalsonger',
+        'socks': 'strumpor',
+        'tights': 'tights leggings träningsbyxor',  # Athletic context
+        'leggings': 'leggings tights',
+        'pantyhose': 'strumpbyxor',
+        'stockings': 'strumpbyxor',
+        'activewear': 'träningskläder',
+        'sportswear': 'träningskläder',
+        'athletic': 'träning sport',
+        'shoes': 'skor',
+        'sneakers': 'sneakers träningsskor',
+        'boots': 'stövlar',
+        'sandals': 'sandaler',
+        'heels': 'klackskor',
+        'flats': 'ballerina',
+        'loafers': 'loafers',
+        'bag': 'väska väskor',
+        'backpack': 'ryggsäck',
+        'purse': 'handväska',
+        'wallet': 'plånbok',
+        'belt': 'bälte bälten',
+        'scarf': 'halsduk sjal',
+        'hat': 'mössa keps hatt',
+        'gloves': 'handskar',
+        'swimwear': 'badkläder',
+        'bikini': 'bikini',
+        'pajamas': 'pyjamas',
+        'robe': 'morgonrock',
+        'men': 'herr man',
+        'women': 'dam kvinna',
+        'kids': 'barn',
+        'boys': 'pojke pojkar',
+        'girls': 'flicka flickor',
+        'fleece': 'fleece fleecetröja',
+        'crew': 'sweatshirt tröja',
+        'half zip': 'halv dragkedja',
+        'running': 'löpar löpning',
     }
 
     # Gender term mappings (common variations → database values)
@@ -425,14 +752,37 @@ class TaxonomyMapper:
         self.local_categories = []
         self.local_genders = []
 
-    def _add_english_aliases(self, swedish_text: str) -> str:
-        """Add English translations to Swedish category text."""
-        result = swedish_text
-        lower_text = swedish_text.lower()
+        # Load bilingual dictionary for word-level translations
+        self.dictionary = get_dictionary()
+        self.dictionary.load()
+
+    def _add_bilingual_aliases(self, text: str) -> str:
+        """Add translations in both directions (Swedish↔English) for better matching.
+
+        Uses both:
+        1. Hardcoded fashion-specific translations (fast, domain-specific)
+        2. WikiDict dictionary for general vocabulary (~70K words each direction)
+        """
+        result = text
+        lower_text = text.lower()
+
+        # 1. Add fashion-specific translations (hardcoded, high quality for fashion)
         for swedish, english in self.SWEDISH_TO_ENGLISH.items():
             if swedish in lower_text:
                 result = f"{result} {english}"
+
+        for english, swedish in self.ENGLISH_TO_SWEDISH.items():
+            if english in lower_text:
+                result = f"{result} {swedish}"
+
+        # 2. Add dictionary translations for remaining words
+        result = self.dictionary.enrich_text(result)
+
         return result
+
+    def _add_english_aliases(self, swedish_text: str) -> str:
+        """Add English translations to Swedish category text (legacy, uses bilingual now)."""
+        return self._add_bilingual_aliases(swedish_text)
 
     def set_local_colors(self, colors: list[dict]):
         self.local_colors = colors
@@ -536,9 +886,13 @@ class TaxonomyMapper:
         """
         Map batch of categories to local taxonomy.
         Priority: product_type > title keywords > detected from image (if confident) > google_category
+
+        Returns dict with: id, name, confidence, suggested_category
+        - If confidence >= threshold: returns matched local category, suggested_category = None
+        - If confidence < threshold: returns "unknown" + AI-generated suggested_category
         """
         if not self.local_categories:
-            return [{"id": None, "name": None, "confidence": 0.0} for _ in detected]
+            return [{"id": None, "name": None, "confidence": 0.0, "suggested_category": None} for _ in detected]
 
         if google_categories is None:
             google_categories = [''] * len(detected)
@@ -592,12 +946,14 @@ class TaxonomyMapper:
         # Process in batches to avoid GPU OOM (N products x 830 categories = huge!)
         BATCH_SIZE = 256
         results = []
+        result_idx = 0  # Track position in original arrays
 
         # Move category embeddings to CPU once
         cat_cpu = self.category_embeddings.cpu()
 
         for i in range(0, len(queries), BATCH_SIZE):
             batch_queries = queries[i:i + BATCH_SIZE]
+            batch_size_actual = len(batch_queries)
 
             # Encode batch on GPU, then move to CPU for similarity
             query_emb = self.model.encode(batch_queries, convert_to_tensor=True, show_progress_bar=False)
@@ -609,16 +965,33 @@ class TaxonomyMapper:
             best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
 
             # Build results for this batch
-            for idx, score in zip(best_idx, best_scores):
+            for j, (idx, score) in enumerate(zip(best_idx, best_scores)):
                 conf = round(score.item(), 3)
+                orig_idx = result_idx + j  # Position in original input arrays
+
                 if conf >= self.config.min_mapping_confidence:
                     results.append({
                         "id": self.local_categories[idx.item()]["id"],
                         "name": self.local_categories[idx.item()]["name"],
-                        "confidence": conf
+                        "confidence": conf,
+                        "suggested_category": None  # Good match, no suggestion needed
                     })
                 else:
-                    results.append({"id": None, "name": "unknown", "confidence": conf})
+                    # Low confidence - generate smart suggestion
+                    suggestion = self.generate_category_suggestion(
+                        detected_category=detected[orig_idx] if orig_idx < len(detected) else '',
+                        product_type=product_types[orig_idx] if orig_idx < len(product_types) else '',
+                        title=titles[orig_idx] if orig_idx < len(titles) else '',
+                        google_category=google_categories[orig_idx] if orig_idx < len(google_categories) else ''
+                    )
+                    results.append({
+                        "id": None,
+                        "name": "unknown",
+                        "confidence": conf,
+                        "suggested_category": suggestion
+                    })
+
+            result_idx += batch_size_actual
 
         return results
 
@@ -637,6 +1010,81 @@ class TaxonomyMapper:
             {"id": self.local_genders[idx.item()]["id"], "name": self.local_genders[idx.item()]["name"], "confidence": round(score.item(), 3)}
             for idx, score in zip(best_idx, best_scores)
         ]
+
+    def generate_category_suggestion(self, detected_category: str, product_type: str,
+                                      title: str, google_category: str = '') -> str:
+        """
+        Generate a smart category suggestion when no good local match exists.
+        Uses CLIP detection + product context to suggest what category should be created.
+
+        Priority:
+        1. Product type (most specific from supplier)
+        2. CLIP detected category (visual analysis)
+        3. Title keywords
+        4. Google category (fallback)
+
+        Returns a normalized, clean category name suggestion.
+        """
+        suggestion_parts = []
+
+        # 1. Normalize product_type if it's a known category
+        if product_type:
+            ptype_lower = product_type.lower().strip()
+            # Check if it's a recognized category we can normalize
+            for key, normalized in self.config.category_normalization.items():
+                if key in ptype_lower:
+                    # Found a match - use normalized version
+                    # Add qualifiers from product_type if present
+                    qualifiers = []
+                    if 'running' in ptype_lower or 'athletic' in ptype_lower or 'sport' in ptype_lower:
+                        qualifiers.append('Athletic')
+                    if 'fleece' in ptype_lower:
+                        qualifiers.append('Fleece')
+                    if 'half zip' in ptype_lower or 'half-zip' in ptype_lower:
+                        qualifiers.append('Half-Zip')
+                    if 'crew' in ptype_lower:
+                        qualifiers.append('Crew Neck')
+                    if 'v-neck' in ptype_lower or 'vneck' in ptype_lower:
+                        qualifiers.append('V-Neck')
+                    if 'long sleeve' in ptype_lower:
+                        qualifiers.append('Long Sleeve')
+                    if 'short sleeve' in ptype_lower:
+                        qualifiers.append('Short Sleeve')
+
+                    if qualifiers:
+                        return f"{' '.join(qualifiers)} {normalized}"
+                    return normalized
+
+            # If no normalization rule, clean up product_type
+            suggestion_parts.append(product_type.strip().title())
+
+        # 2. Use CLIP detected category if product_type was empty
+        if not suggestion_parts and detected_category:
+            detected_lower = detected_category.lower()
+            normalized = self.config.category_normalization.get(detected_lower)
+            if normalized:
+                suggestion_parts.append(normalized)
+            else:
+                suggestion_parts.append(detected_category.title())
+
+        # 3. Extract from title if still empty
+        if not suggestion_parts and title:
+            title_lower = title.lower()
+            for key, normalized in self.config.category_normalization.items():
+                if key in title_lower:
+                    suggestion_parts.append(normalized)
+                    break
+
+        # 4. Fallback to Google category last segment
+        if not suggestion_parts and google_category and '>' in google_category:
+            last_segment = google_category.split('>')[-1].strip()
+            if last_segment and last_segment.lower() not in ['clothing', 'apparel', 'accessories', 'other']:
+                suggestion_parts.append(last_segment.title())
+
+        # Return suggestion or None if we couldn't generate one
+        if suggestion_parts:
+            return suggestion_parts[0]  # Return first/best suggestion
+        return None
 
     def nlp_classify_categories(self, titles: list[str], descriptions: list[str],
                                  product_types: list[str]) -> list[dict]:
@@ -1090,6 +1538,8 @@ class ProductEnrichmentPipeline:
                 product['mapped_local_category_id'] = mapped_categories[i]["id"]
                 product['mapped_local_category'] = mapped_categories[i]["name"]
                 product['category_mapping_confidence'] = mapped_categories[i]["confidence"]
+                # AI-suggested category when no good local match exists
+                product['suggested_category_name'] = mapped_categories[i].get("suggested_category")
 
                 # Size type
                 product['size_type'] = size_results[i]["size_type"]
@@ -1111,7 +1561,8 @@ class ProductEnrichmentPipeline:
                     product['zeroshot_category_id'] = mapped_categories[i]["id"]
                     product['zeroshot_category'] = mapped_categories[i]["name"]
                     product['zeroshot_category_confidence'] = mapped_categories[i]["confidence"]
-                    product['suggestion_create_category_name'] = product_types[i] if mapped_categories[i]["confidence"] < self.config.min_mapping_confidence else None
+                    # Use the smart AI-generated suggestion instead of just product_type
+                    product['suggestion_create_category_name'] = mapped_categories[i].get("suggested_category")
 
             # Write output
             self.write_csv(products, output_path)
