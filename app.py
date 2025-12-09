@@ -278,6 +278,10 @@ class FashionImageProcessor:
 
         logger.info(f"Pre-computed embeddings for {len(self.config.color_prompts)} colors, {len(self.config.category_prompts)} categories")
 
+    def _preprocess_worker(self, img: Image.Image) -> torch.Tensor:
+        """Preprocess single image (for parallel execution)."""
+        return self.preprocess(img)
+
     @torch.no_grad()
     def process_batch(self, images: list[Image.Image]) -> list[dict]:
         """Process batch of images - returns color and category predictions."""
@@ -291,8 +295,11 @@ class FashionImageProcessor:
         if not valid_images:
             return [{"color": None, "category": None, "color_conf": 0, "category_conf": 0} for _ in images]
 
-        # Preprocess and stack images
-        processed_images = torch.stack([self.preprocess(img) for img in valid_images]).to(self.device)
+        # PARALLEL preprocessing using ThreadPoolExecutor (CPU-bound)
+        with ThreadPoolExecutor(max_workers=self.config.num_workers) as executor:
+            preprocessed = list(executor.map(self._preprocess_worker, valid_images))
+
+        processed_images = torch.stack(preprocessed).to(self.device)
         if self.config.use_fp16:
             processed_images = processed_images.half()
 
@@ -948,27 +955,29 @@ class ProductEnrichmentPipeline:
             else:
                 logger.info("Skipping zero-shot category (use_zeroshot_category=False for speed)")
 
-            # PARALLEL TASK 3: Process images in batches
-            all_clip_results = []
+            # STEP 1: Download ALL images first (fast with 1000 concurrent connections)
+            logger.info("Downloading all images...")
+            all_urls = [p.get('image_link', '') for p in products]
+
             async with FastImageDownloader(self.config) as downloader:
-                with tqdm(total=num_batches, desc="Processing batches", unit="batch") as pbar:
-                    for batch_idx in range(num_batches):
-                        start_idx = batch_idx * batch_size
-                        end_idx = min(start_idx + batch_size, total)
-                        batch_products = products[start_idx:end_idx]
-
-                        # Process batch
-                        clip_results = await self.process_images_batch(batch_products, downloader)
-                        all_clip_results.extend(clip_results)
-
-                        # Update progress
-                        pbar.set_postfix({
-                            "products": f"{end_idx}/{total}",
-                            "downloads": f"{downloader.stats['success']}/{downloader.stats['success'] + downloader.stats['failed']}"
-                        })
-                        pbar.update(1)
-
+                all_images = await downloader.download_batch(all_urls)
                 logger.info(f"Image downloads: {downloader.stats['success']} success, {downloader.stats['failed']} failed")
+
+            # STEP 2: Process ALL images on GPU in batches (no network waiting)
+            logger.info("Processing images on GPU...")
+            all_clip_results = []
+            with tqdm(total=num_batches, desc="GPU processing", unit="batch") as pbar:
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, total)
+                    batch_images = all_images[start_idx:end_idx]
+
+                    # Pure GPU processing - no network IO
+                    clip_results = self.fashion.process_batch(batch_images)
+                    all_clip_results.extend(clip_results)
+
+                    pbar.set_postfix({"products": f"{end_idx}/{total}"})
+                    pbar.update(1)
 
             # Wait for parallel tasks to complete
             logger.info("Waiting for classification to complete...")
@@ -988,16 +997,23 @@ class ProductEnrichmentPipeline:
             detected_categories = [r["category"] for r in all_clip_results]
             detected_category_confidences = [r["category_conf"] for r in all_clip_results]
 
-            # Map to local taxonomy (fast, batch processing)
-            # Pass confidence so we can ignore low-confidence detections (< 0.15)
-            logger.info("Mapping to local taxonomy...")
-            mapped_colors = self.mapper.map_batch_colors(
-                detected_colors, csv_colors, detected_color_confidences
+            # Map to local taxonomy IN PARALLEL (all use GPU sentence transformer)
+            logger.info("Mapping to local taxonomy (parallel)...")
+
+            # Run all three mappings concurrently
+            color_task = asyncio.create_task(asyncio.to_thread(
+                self.mapper.map_batch_colors, detected_colors, csv_colors, detected_color_confidences
+            ))
+            cat_task = asyncio.create_task(asyncio.to_thread(
+                self.mapper.map_batch_categories, detected_categories, product_types, google_categories, detected_category_confidences, titles
+            ))
+            gender_task = asyncio.create_task(asyncio.to_thread(
+                self.mapper.map_batch_genders, csv_genders
+            ))
+
+            mapped_colors, mapped_categories, mapped_genders = await asyncio.gather(
+                color_task, cat_task, gender_task
             )
-            mapped_categories = self.mapper.map_batch_categories(
-                detected_categories, product_types, google_categories, detected_category_confidences, titles
-            )
-            mapped_genders = self.mapper.map_batch_genders(csv_genders)
 
             # Enrich products
             logger.info("Enriching products...")
