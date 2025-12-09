@@ -1964,8 +1964,89 @@ class ProductEnrichmentPipeline:
 
         return clip_results
 
+    def _process_text_categories(self, product_types: list[str], google_categories: list[str],
+                                  titles: list[str], descriptions: list[str],
+                                  size_contexts: list[dict], item_group_ids: list[str]) -> tuple[list[dict], list[dict]]:
+        """Process categories using TEXT only (no images).
+
+        OPTIMIZATION: Deduplicates by item_group_id - variants of same product share category.
+        Returns (mapped_categories, llm_categories) for ALL products.
+        """
+        total_products = len(product_types)
+
+        # =====================================================================
+        # DEDUPLICATION: Group by item_group_id, process only unique groups
+        # =====================================================================
+        group_to_indices = {}  # item_group_id -> list of product indices
+        unique_indices = []     # First index of each unique group
+
+        for i, group_id in enumerate(item_group_ids):
+            # Use group_id if available, otherwise treat each product as unique
+            key = group_id if group_id else f"__unique_{i}"
+            if key not in group_to_indices:
+                group_to_indices[key] = []
+                unique_indices.append(i)  # First product in this group
+            group_to_indices[key].append(i)
+
+        num_unique = len(unique_indices)
+        logger.info(f"Category dedup: {total_products} products -> {num_unique} unique groups ({100*num_unique/total_products:.1f}%)")
+
+        # Extract data for unique products only
+        unique_product_types = [product_types[i] for i in unique_indices]
+        unique_google_cats = [google_categories[i] for i in unique_indices]
+        unique_titles = [titles[i] for i in unique_indices]
+        unique_descriptions = [descriptions[i] for i in unique_indices]
+        unique_contexts = [size_contexts[i] for i in unique_indices]
+
+        # Dummy detected values since we don't use images for categories anymore
+        dummy_detected = [''] * num_unique
+        dummy_confidences = [0.0] * num_unique
+
+        # Embedding-based category matching (TEXT only) - on UNIQUE products only
+        logger.info(f"Running text-based category embeddings on {num_unique} unique groups...")
+        unique_mapped = self.mapper.map_batch_categories(
+            dummy_detected, unique_product_types, unique_google_cats, dummy_confidences,
+            unique_titles, unique_descriptions
+        )
+
+        # LLM for low-confidence matches - on UNIQUE products only
+        unique_llm = [None] * num_unique
+        if self.config.use_llm_category and self.llm_classifier:
+            low_conf_unique_indices = [
+                i for i, cat in enumerate(unique_mapped)
+                if cat["confidence"] < self.config.llm_confidence_threshold
+            ]
+
+            if low_conf_unique_indices:
+                logger.info(f"Running LLM on {len(low_conf_unique_indices)}/{num_unique} low-confidence groups...")
+                low_conf_contexts = [unique_contexts[i] for i in low_conf_unique_indices]
+                llm_results = self.llm_classifier.classify_batch(low_conf_contexts)
+
+                for idx, result in zip(low_conf_unique_indices, llm_results):
+                    unique_llm[idx] = result
+                logger.info("LLM classification complete!")
+            else:
+                logger.info("All groups matched with high confidence - skipping LLM")
+
+        # =====================================================================
+        # EXPAND: Map results back to ALL products (variants share category)
+        # =====================================================================
+        mapped_categories = [None] * total_products
+        llm_categories = [None] * total_products
+
+        for unique_idx, original_idx in enumerate(unique_indices):
+            # Get the group_id for this unique product
+            group_id = item_group_ids[original_idx] if item_group_ids[original_idx] else f"__unique_{original_idx}"
+
+            # Apply result to ALL products in this group
+            for product_idx in group_to_indices[group_id]:
+                mapped_categories[product_idx] = unique_mapped[unique_idx]
+                llm_categories[product_idx] = unique_llm[unique_idx]
+
+        return mapped_categories, llm_categories
+
     async def run(self, input_path: str, output_path: str):
-        """Run the full pipeline with parallel execution."""
+        """Run the full pipeline with PARALLEL execution for maximum speed."""
         start_time = time.time()
 
         try:
@@ -1978,7 +2059,7 @@ class ProductEnrichmentPipeline:
             num_batches = (total + batch_size - 1) // batch_size
 
             logger.info("=" * 60)
-            logger.info(f"PROCESSING {total} PRODUCTS")
+            logger.info(f"PROCESSING {total} PRODUCTS (PARALLEL MODE)")
             logger.info(f"Batch size: {batch_size}, Total batches: {num_batches}")
             logger.info("=" * 60)
 
@@ -1989,8 +2070,9 @@ class ProductEnrichmentPipeline:
             google_categories = [p.get('google_product_category', '') for p in products]
             titles = [p.get('title', '') for p in products]
             descriptions = [p.get('description', '') for p in products]
+            item_group_ids = [p.get('item_group_id', '') for p in products]  # For deduplication
 
-            # Build rich context for size classification (uses ALL available signals)
+            # Build rich context for classification
             size_contexts = [
                 {
                     'title': p.get('title', ''),
@@ -2001,99 +2083,90 @@ class ProductEnrichmentPipeline:
                 for p in products
             ]
 
-            # PARALLEL TASK 1: Size type classification (doesn't need images!)
-            logger.info("Starting size type classification (parallel)...")
+            # =====================================================================
+            # PARALLEL EXECUTION: Run TEXT and IMAGE processing simultaneously
+            # =====================================================================
+
+            # PARALLEL TASK 1: Size type classification (TEXT only)
+            logger.info("Starting PARALLEL tasks...")
+            logger.info("  -> Task 1: Size classification (text)")
             size_task = asyncio.create_task(
                 asyncio.to_thread(self.size_classifier.classify_all, size_contexts)
             )
 
-            # PARALLEL TASK 2: Zero-shot category classification (OPTIONAL - slow but accurate)
-            category_task = None
+            # PARALLEL TASK 2: Category embeddings + LLM (TEXT only - DEDUPLICATED by item_group_id!)
+            logger.info("  -> Task 2: Category embeddings + LLM (text, deduplicated)")
+            category_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._process_text_categories,
+                    product_types, google_categories, titles, descriptions, size_contexts, item_group_ids
+                )
+            )
+
+            # PARALLEL TASK 3: Zero-shot category (OPTIONAL)
+            zeroshot_task = None
             if self.config.use_zeroshot_category:
-                logger.info("Starting zero-shot category classification (parallel)...")
-                category_task = asyncio.create_task(
+                logger.info("  -> Task 3: Zero-shot classification (text)")
+                zeroshot_task = asyncio.create_task(
                     asyncio.to_thread(self.category_classifier.classify_batch, size_contexts)
                 )
-            else:
-                logger.info("Skipping zero-shot category (use_zeroshot_category=False for speed)")
 
-            # STEP 1: Download ALL images first (fast with 1000 concurrent connections)
-            logger.info("Downloading all images...")
+            # PARALLEL TASK 4: Download + CLIP for COLORS (IMAGE-based)
+            logger.info("  -> Task 4: Image download + CLIP colors")
             all_urls = [p.get('image_link', '') for p in products]
 
             async with FastImageDownloader(self.config) as downloader:
                 all_images = await downloader.download_batch(all_urls)
                 logger.info(f"Image downloads: {downloader.stats['success']} success, {downloader.stats['failed']} failed")
 
-            # STEP 2: Process ALL images on GPU in batches (no network waiting)
-            logger.info("Processing images on GPU...")
+            # Process images on GPU for COLOR detection only
+            logger.info("Processing images on GPU (color detection)...")
             all_clip_results = []
-            with tqdm(total=num_batches, desc="GPU processing", unit="batch") as pbar:
+            with tqdm(total=num_batches, desc="GPU colors", unit="batch") as pbar:
                 for batch_idx in range(num_batches):
                     start_idx = batch_idx * batch_size
                     end_idx = min(start_idx + batch_size, total)
                     batch_images = all_images[start_idx:end_idx]
-
-                    # Pure GPU processing - no network IO
                     clip_results = self.fashion.process_batch(batch_images)
                     all_clip_results.extend(clip_results)
-
                     pbar.set_postfix({"products": f"{end_idx}/{total}"})
                     pbar.update(1)
 
-            # Wait for parallel tasks to complete
-            logger.info("Waiting for classification to complete...")
+            # =====================================================================
+            # Wait for all parallel tasks to complete
+            # =====================================================================
+            logger.info("Waiting for parallel tasks to complete...")
+
             size_results = await size_task
+            logger.info("  -> Size classification: DONE")
 
-            # Only await category if enabled
-            if category_task:
-                zeroshot_categories = await category_task
+            mapped_categories, llm_categories = await category_task
+            logger.info("  -> Category embeddings + LLM: DONE")
+
+            if zeroshot_task:
+                zeroshot_categories = await zeroshot_task
+                logger.info("  -> Zero-shot classification: DONE")
             else:
-                # Use empty results when disabled
                 zeroshot_categories = [{"id": None, "name": None, "confidence": 0.0, "suggestion": None} for _ in products]
-            logger.info("Classification tasks complete!")
 
-            # Extract detected values with confidence scores
-            # CLIP now detects directly into YOUR local colors!
+            logger.info("All parallel tasks complete!")
+
+            # Extract color values from CLIP (images used for COLOR only)
             detected_colors = [r["color"] for r in all_clip_results]
             detected_color_ids = [r["color_id"] for r in all_clip_results]
             detected_color_confidences = [r["color_conf"] for r in all_clip_results]
-            detected_categories = [r["category"] for r in all_clip_results]
+            detected_categories = [r["category"] for r in all_clip_results]  # Kept for reference only
             detected_category_confidences = [r["category_conf"] for r in all_clip_results]
 
-            # Free GPU memory before taxonomy mapping
+            # Free GPU memory
             torch.cuda.empty_cache()
 
-            # Map to local taxonomy (sequential - parallel causes GPU OOM)
-            logger.info("Mapping to local taxonomy...")
+            # Map colors and genders (fast operations)
+            logger.info("Mapping colors and genders...")
             mapped_colors = self.mapper.map_batch_colors(
                 detected_colors, csv_colors, detected_color_confidences
             )
-            mapped_categories = self.mapper.map_batch_categories(
-                detected_categories, product_types, google_categories, detected_category_confidences, titles, descriptions
-            )
             mapped_genders = self.mapper.map_batch_genders(csv_genders)
-
-            # LLM-based category classification (only for low-confidence matches - saves time!)
-            llm_categories = [None] * len(products)
-            if self.config.use_llm_category and self.llm_classifier:
-                # Find products with low embedding confidence
-                low_conf_indices = [
-                    i for i, cat in enumerate(mapped_categories)
-                    if cat["confidence"] < self.config.llm_confidence_threshold
-                ]
-
-                if low_conf_indices:
-                    logger.info(f"Running LLM on {len(low_conf_indices)}/{len(products)} low-confidence products...")
-                    low_conf_contexts = [size_contexts[i] for i in low_conf_indices]
-                    llm_results = self.llm_classifier.classify_batch(low_conf_contexts)
-
-                    # Map results back
-                    for idx, result in zip(low_conf_indices, llm_results):
-                        llm_categories[idx] = result
-                    logger.info("LLM classification complete!")
-                else:
-                    logger.info("All products matched with high confidence - skipping LLM")
 
             # Enrich products
             logger.info("Enriching products...")
