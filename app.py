@@ -75,7 +75,8 @@ class Config:
     # LLM-based category matching - uses a local LLM for accurate understanding
     # Much more accurate but slower than embedding matching
     use_llm_category: bool = True  # Enable for best accuracy
-    llm_model: str = "Qwen/Qwen2.5-7B-Instruct"  # Excellent multilingual LLM (~14GB) - understands Swedish well
+    llm_model: str = "Qwen/Qwen2.5-3B-Instruct"  # Fast multilingual LLM (~6GB) - good Swedish understanding
+    llm_confidence_threshold: float = 0.75  # Only use LLM if embedding confidence < this (saves time)
 
     # Models - OPTIMIZED for A10's 24GB VRAM
     # FashionSigLIP outperforms FashionCLIP on fashion benchmarks
@@ -1497,7 +1498,7 @@ class LLMCategoryClassifier:
         )
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.llm_model,
-            torch_dtype=torch.float16,
+            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto",
             trust_remote_code=True
         )
@@ -2026,12 +2027,26 @@ class ProductEnrichmentPipeline:
             )
             mapped_genders = self.mapper.map_batch_genders(csv_genders)
 
-            # LLM-based category classification (most accurate)
-            llm_categories = None
+            # LLM-based category classification (only for low-confidence matches - saves time!)
+            llm_categories = [None] * len(products)
             if self.config.use_llm_category and self.llm_classifier:
-                logger.info("Running LLM category classification...")
-                llm_categories = self.llm_classifier.classify_batch(size_contexts)
-                logger.info("LLM classification complete!")
+                # Find products with low embedding confidence
+                low_conf_indices = [
+                    i for i, cat in enumerate(mapped_categories)
+                    if cat["confidence"] < self.config.llm_confidence_threshold
+                ]
+
+                if low_conf_indices:
+                    logger.info(f"Running LLM on {len(low_conf_indices)}/{len(products)} low-confidence products...")
+                    low_conf_contexts = [size_contexts[i] for i in low_conf_indices]
+                    llm_results = self.llm_classifier.classify_batch(low_conf_contexts)
+
+                    # Map results back
+                    for idx, result in zip(low_conf_indices, llm_results):
+                        llm_categories[idx] = result
+                    logger.info("LLM classification complete!")
+                else:
+                    logger.info("All products matched with high confidence - skipping LLM")
 
             # Enrich products
             logger.info("Enriching products...")
@@ -2056,24 +2071,30 @@ class ProductEnrichmentPipeline:
                 product['suggested_category_name'] = mapped_categories[i].get("suggested_category")
 
                 # LLM-based category (most accurate - uses NLU to understand product)
-                if llm_categories:
-                    product['llm_category_id'] = llm_categories[i]["id"]
-                    product['llm_category'] = llm_categories[i]["name"]
-                    product['llm_category_confidence'] = llm_categories[i]["confidence"]
-                    product['llm_suggested_category'] = llm_categories[i].get("suggested_category")
-                    # Use LLM as primary if enabled and has result
-                    if llm_categories[i]["id"]:
-                        product['best_category_id'] = llm_categories[i]["id"]
-                        product['best_category'] = llm_categories[i]["name"]
+                llm_result = llm_categories[i] if llm_categories and llm_categories[i] else None
+                if llm_result:
+                    product['llm_category_id'] = llm_result["id"]
+                    product['llm_category'] = llm_result["name"]
+                    product['llm_category_confidence'] = llm_result["confidence"]
+                    product['llm_suggested_category'] = llm_result.get("suggested_category")
+                    # Use LLM as primary if has result
+                    if llm_result["id"]:
+                        product['best_category_id'] = llm_result["id"]
+                        product['best_category'] = llm_result["name"]
                         product['best_category_source'] = "llm"
                     else:
                         product['best_category_id'] = mapped_categories[i]["id"]
                         product['best_category'] = mapped_categories[i]["name"]
                         product['best_category_source'] = "embedding"
                 else:
+                    # High confidence embedding match - no LLM needed
+                    product['llm_category_id'] = None
+                    product['llm_category'] = None
+                    product['llm_category_confidence'] = None
+                    product['llm_suggested_category'] = None
                     product['best_category_id'] = mapped_categories[i]["id"]
                     product['best_category'] = mapped_categories[i]["name"]
-                    product['best_category_source'] = "embedding"
+                    product['best_category_source'] = "embedding_high_conf"
 
                 # Size type
                 product['size_type'] = size_results[i]["size_type"]
