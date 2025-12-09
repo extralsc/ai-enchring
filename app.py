@@ -73,11 +73,11 @@ class Config:
     use_neural_translation: bool = True  # Enable for multi-language support
 
     # LLM-based category matching - uses a local LLM for accurate understanding
-    # Much more accurate but slower than embedding matching
+    # LLM understands that "Jacket" = "Jacka" = "Ytterplagg" (multilingual semantics)
     use_llm_category: bool = True  # Enable for best accuracy
     llm_model: str = "Qwen/Qwen2.5-3B-Instruct"  # Good multilingual LLM
     use_vllm: bool = True  # Use vLLM for faster, stable inference
-    llm_confidence_threshold: float = 0.90  # Only use LLM if embedding confidence < this (saves time)
+    llm_confidence_threshold: float = 1.0  # Use LLM for ALL products (LLM knows Bag=Väska)
 
     # Models - OPTIMIZED for A10's 24GB VRAM
     # FashionSigLIP outperforms FashionCLIP on fashion benchmarks
@@ -902,29 +902,15 @@ class TaxonomyMapper:
         if not self.local_categories:
             return [{"id": None, "name": None, "confidence": 0.0, "suggested_category": None} for _ in product_types]
 
-        # Build queries - use GPT-SW3 to translate English product types to Swedish
+        # Build queries - LLM handles multilingual matching (knows Jacket=Jacka)
+        # Dictionary enrichment still helps embeddings as a baseline
         queries = []
-
-        # Collect unique English product types for batch translation
-        unique_english_types = list(set(p for p in product_types if p and self._is_english(p)))
-
-        # Translate English product types to Swedish using GPT-SW3
-        translation_map = {}
-        if unique_english_types:
-            logger.info(f"Translating {len(unique_english_types)} unique English product types to Swedish with GPT-SW3...")
-            translated = self.translator.translate_batch(unique_english_types, src_lang='en')
-            translation_map = dict(zip(unique_english_types, translated))
-            logger.info(f"Translations: {list(translation_map.items())[:5]}...")
-
         for p, title, desc in zip(product_types, titles, descriptions):
             parts = []
 
-            # 1. Product type - include both original AND Swedish translation
+            # 1. Product type (e.g., "Pants", "Jacket", "Tröja")
             if p:
                 parts.append(p)
-                # Add GPT-SW3 translation if available
-                if p in translation_map and translation_map[p]:
-                    parts.append(translation_map[p])
 
             # 2. Title keywords
             if title:
@@ -934,7 +920,7 @@ class TaxonomyMapper:
             if desc:
                 parts.append(desc[:100])
 
-            # Build query and enrich with dictionary (adds word-level translations)
+            # Build query - dictionary adds word-level translations for embedding baseline
             query = ' '.join(parts) if parts else 'unknown'
             query = self.dictionary.enrich_text(query)
             queries.append(query)
@@ -1316,19 +1302,15 @@ class LLMCategoryClassifier:
     def set_categories(self, categories: list[dict]):
         """Set available categories from database."""
         self.local_categories = categories
-        # Build category list - limit to avoid prompt overflow
-        # Group unique names and create embeddings for semantic search
-        cat_names = sorted(set(c["name"] for c in categories))
-        self.all_category_names = cat_names
+        self.all_category_names = [c["name"] for c in categories]
 
-        # For LLM prompt, limit to 200 most common/important categories
-        # The LLM will match semantically, so we don't need ALL names
-        MAX_CATEGORIES_IN_PROMPT = 200
-        self.category_list_str = ", ".join(cat_names[:MAX_CATEGORIES_IN_PROMPT])
-        if len(cat_names) > MAX_CATEGORIES_IN_PROMPT:
-            self.category_list_str += f" (and {len(cat_names) - MAX_CATEGORIES_IN_PROMPT} more)"
+        # Build category string for LLM prompt - include ALL categories
+        # Local LLM has no token limits, and Qwen 3B has 32K context
+        # LLM is smart enough to find the right match from the full list
+        unique_names = sorted(set(self.all_category_names))
+        self.category_list_str = ", ".join(unique_names)
 
-        logger.info(f"LLM Classifier: {len(cat_names)} categories, {min(len(cat_names), MAX_CATEGORIES_IN_PROMPT)} in prompt")
+        logger.info(f"LLM Classifier: {len(unique_names)} unique categories in prompt")
 
     def classify_batch(self, contexts: list[dict]) -> list[dict]:
         """
@@ -1410,34 +1392,20 @@ class LLMCategoryClassifier:
         title = ctx.get('title', '')
         description = ctx.get('description', '')[:300]
 
-        prompt = f"""You are a Swedish e-commerce product categorization expert. Match products to Swedish category names.
+        prompt = f"""You are a Swedish e-commerce categorization expert.
 
-Product Information:
+Product:
 - Type: {product_type}
 - Title: {title}
 - Description: {description}
 
-Available Categories (Swedish): {self.category_list_str}
+Swedish Categories: {self.category_list_str}
 
-IMPORTANT: Categories are in Swedish. Common translations:
-- Jacket/Coat = Jacka, Ytterplagg, Skaljacka
-- Pants/Trousers = Byxor, Skalbyxor
-- Shirt = Skjorta, Tröja
-- Dress = Klänning
-- Shoes = Skor
-- Boots = Stövlar, Kängor
+Task: Pick the BEST matching Swedish category. You understand English=Swedish (Jacket=Jacka, Bag=Väska, Pants=Byxor, Shoes=Skor, Dress=Klänning).
 
-Instructions:
-1. Understand what this product IS (jacket, pants, shoes, etc.)
-2. Find the BEST matching Swedish category from the list
-3. Match semantically - "Jacket" should match "Jacka" or "Ytterplagg"
-
-Respond in this exact format:
-CATEGORY: [exact Swedish category name from the list]
-CONFIDENCE: [high/medium/low]
-SUGGESTION: [new category name if no good match, otherwise "none"]
-
-Response:"""
+Reply with ONLY:
+CATEGORY: [exact category name]
+CONFIDENCE: [high/medium/low]"""
         return prompt
 
     def _parse_response(self, answer: str, cat_lookup: dict, ctx: dict) -> dict:
