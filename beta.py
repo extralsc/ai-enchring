@@ -264,7 +264,7 @@ class EmbeddingModel:
             return self.category_embeddings_cache[cache_key]
 
         # För Level 1: berika med barn-kategorier för bättre matching
-        if cache_key == "level_1" and category_cache:
+        if cache_key.startswith("level_1") and category_cache:
             names = []
             for cat in categories:
                 children = category_cache.get_children(cat['id'])
@@ -274,7 +274,9 @@ class EmbeddingModel:
                     names.append(enriched)
                 else:
                     names.append(cat['name'])
-            logger.info(f"Level 1 berikade kategorier: {names[:3]}...")
+            logger.info(f"Level 1 berikade kategorier ({cache_key}, {len(categories)} st):")
+            for n in names:
+                logger.info(f"  -> {n[:100]}...")
         else:
             names = [cat['name'] for cat in categories]
 
@@ -396,6 +398,12 @@ class HierarchicalClassifier:
             weight_title=self.config.l1_weight_title,
             weight_desc=self.config.l1_weight_desc
         )
+
+        # Debug: visa första produktens fält
+        if products:
+            pt, t, d = self._get_product_fields(products[0])
+            logger.info(f"Exempel produkt 1: type='{pt}', title='{t[:50]}...', gender='{products[0].get('gender', '')}'")
+            logger.info(f"Gender-grupper: {list(gender_groups.keys())}")
 
         # Matcha varje gender-grupp mot sina kategorier
         for gender, indices in gender_groups.items():
