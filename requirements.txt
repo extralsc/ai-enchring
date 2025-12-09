@@ -1,9 +1,15 @@
 # Product Enrichment Pipeline Dependencies
 # For NVIDIA A10 GPU (24GB VRAM)
+#
+# IMPORTANT: Install torch first with CUDA support:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# Then install the rest:
+#   pip install -r requirements.txt
 
-# Core
-torch>=2.0.0
-torchvision>=0.15.0
+# Core (install separately with CUDA - see above)
+# torch>=2.0.0
+# torchvision>=0.15.0
 
 # Hugging Face
 transformers>=4.35.0
@@ -31,3 +37,13 @@ tqdm>=4.66.0
 
 # Numerical
 numpy>=1.24.0
+
+# Neural translation (Helsinki-NLP MarianMT)
+sentencepiece>=0.1.99
+
+# vLLM for fast LLM inference (optional but recommended)
+# Install separately: pip install vllm
+# vllm>=0.4.0
+
+# Accelerate for efficient model loading
+accelerate>=0.25.0
