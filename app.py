@@ -87,8 +87,12 @@ class Config:
 
     size_type_labels: list = field(default_factory=lambda: [
         "jeans/pants", "shirt/top", "dress", "shoes", "socks",
-        "underwear", "jacket/coat", "accessories", "swimwear", "one-size"
+        "underwear", "jacket/coat", "accessories", "swimwear", "one-size",
+        "leggings/tights", "skirt"
     ])
+
+    # Minimum confidence to consider a mapping valid (otherwise return "unknown")
+    min_mapping_confidence: float = 0.5
 
     def get_db_url(self) -> str:
         if self.db_url:
@@ -338,6 +342,9 @@ class TaxonomyMapper:
         'barn': 'kids children',
         'man': 'men mens male man',
         'woman': 'women womens female woman',
+        'tights': 'tights leggings',
+        'kjolar': 'skirts',
+        'kjol': 'skirt',
     }
 
     # Gender term mappings (common variations → database values)
@@ -494,10 +501,19 @@ class TaxonomyMapper:
         best_idx = sims.argmax(dim=1)
         best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
 
-        return [
-            {"id": self.local_categories[idx.item()]["id"], "name": self.local_categories[idx.item()]["name"], "confidence": round(score.item(), 3)}
-            for idx, score in zip(best_idx, best_scores)
-        ]
+        # Return results, but mark as "unknown" if confidence too low
+        results = []
+        for idx, score in zip(best_idx, best_scores):
+            conf = round(score.item(), 3)
+            if conf >= self.config.min_mapping_confidence:
+                results.append({
+                    "id": self.local_categories[idx.item()]["id"],
+                    "name": self.local_categories[idx.item()]["name"],
+                    "confidence": conf
+                })
+            else:
+                results.append({"id": None, "name": "unknown", "confidence": conf})
+        return results
 
     def map_batch_genders(self, csv_genders: list[str]) -> list[dict]:
         """Map batch of genders to local taxonomy."""
@@ -543,10 +559,113 @@ class TaxonomyMapper:
         best_idx = sims.argmax(dim=1)
         best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
 
-        return [
-            {"id": self.local_categories[idx.item()]["id"], "name": self.local_categories[idx.item()]["name"], "confidence": round(score.item(), 3)}
-            for idx, score in zip(best_idx, best_scores)
-        ]
+        # Return results, but mark as "unknown" if confidence too low
+        results = []
+        for idx, score in zip(best_idx, best_scores):
+            conf = round(score.item(), 3)
+            if conf >= self.config.min_mapping_confidence:
+                results.append({
+                    "id": self.local_categories[idx.item()]["id"],
+                    "name": self.local_categories[idx.item()]["name"],
+                    "confidence": conf
+                })
+            else:
+                results.append({"id": None, "name": "unknown", "confidence": conf})
+        return results
+
+
+# =============================================================================
+# CATEGORY CLASSIFIER - Zero-shot with BART
+# =============================================================================
+
+class CategoryClassifier:
+    """Zero-shot classifier for product categories using BART.
+
+    Uses actual database category names as labels for proper classification.
+    Much more accurate than sentence similarity matching.
+    """
+
+    def __init__(self, config: Config, classifier_pipeline):
+        self.config = config
+        self.classifier = classifier_pipeline
+        self.category_labels = []
+        self.category_map = {}  # label -> {id, name, path}
+
+    def set_categories(self, categories: list[dict]):
+        """Set available categories from database."""
+        # Group by name to avoid duplicates, prefer higher level (more general)
+        seen_names = {}
+        for cat in categories:
+            name = cat['name']
+            if name not in seen_names or cat.get('level', 99) < seen_names[name].get('level', 99):
+                seen_names[name] = cat
+
+        self.category_map = {cat['name']: cat for cat in seen_names.values()}
+        self.category_labels = list(self.category_map.keys())
+        logger.info(f"CategoryClassifier loaded {len(self.category_labels)} unique category labels")
+
+    def classify_batch(self, contexts: list[dict]) -> list[dict]:
+        """
+        Classify products into categories using zero-shot classification.
+        Returns category match + suggestion if no good match.
+        """
+        if not self.category_labels:
+            return [{"id": None, "name": "unknown", "confidence": 0.0, "suggestion": None} for _ in contexts]
+
+        # Build text for classification
+        texts = []
+        for ctx in contexts:
+            parts = []
+            if ctx.get('product_type'):
+                parts.append(ctx['product_type'])
+            if ctx.get('title'):
+                parts.append(ctx['title'])
+            if ctx.get('description'):
+                parts.append(ctx['description'][:150])
+            texts.append(' '.join(parts) if parts else 'unknown product')
+
+        # Classify in batches
+        results = []
+        batch_size = 16  # Smaller batches for many labels
+
+        for i in tqdm(range(0, len(texts), batch_size), desc="Classifying categories", leave=False):
+            batch_texts = texts[i:i+batch_size]
+            batch_contexts = contexts[i:i+batch_size]
+
+            # Run classification
+            outputs = self.classifier(
+                batch_texts,
+                self.category_labels,
+                multi_label=False,
+                batch_size=batch_size
+            )
+
+            # Handle single result vs list
+            if isinstance(outputs, dict):
+                outputs = [outputs]
+
+            for j, out in enumerate(outputs):
+                best_label = out['labels'][0]
+                best_score = out['scores'][0]
+
+                cat_info = self.category_map.get(best_label, {})
+
+                # If confidence too low, suggest creating a new category
+                suggestion = None
+                if best_score < self.config.min_mapping_confidence:
+                    # Generate suggestion from product_type
+                    ptype = batch_contexts[j].get('product_type', '')
+                    if ptype:
+                        suggestion = ptype
+
+                results.append({
+                    "id": cat_info.get('id') if best_score >= self.config.min_mapping_confidence else None,
+                    "name": best_label if best_score >= self.config.min_mapping_confidence else "unknown",
+                    "confidence": round(best_score, 3),
+                    "suggestion": suggestion
+                })
+
+        return results
 
 
 # =============================================================================
@@ -659,6 +778,11 @@ class ProductEnrichmentPipeline:
 
         logger.info("Loading BART classifier...")
         self.size_classifier = SizeTypeClassifier(self.config)
+
+        # Share BART pipeline for category classification (saves memory)
+        logger.info("Setting up Category classifier (zero-shot)...")
+        self.category_classifier = CategoryClassifier(self.config, self.size_classifier.classifier)
+        self.category_classifier.set_categories(categories)
 
         logger.info("All models loaded!")
 
@@ -784,9 +908,9 @@ class ProductEnrichmentPipeline:
             )
             mapped_genders = self.mapper.map_batch_genders(csv_genders)
 
-            # BETA: NLP-based category classification (text only, no images)
-            logger.info("Running NLP category classification (beta)...")
-            nlp_categories = self.mapper.nlp_classify_categories(titles, descriptions, product_types)
+            # Zero-shot category classification using BART (much more accurate)
+            logger.info("Running zero-shot category classification...")
+            zeroshot_categories = self.category_classifier.classify_batch(size_contexts)
 
             # Enrich products
             logger.info("Enriching products...")
@@ -798,7 +922,7 @@ class ProductEnrichmentPipeline:
                 product['mapped_local_color'] = mapped_colors[i]["name"]
                 product['color_mapping_confidence'] = mapped_colors[i]["confidence"]
 
-                # Category
+                # Category (image-based + similarity matching - kept for comparison)
                 product['detected_category'] = detected_categories[i]
                 product['detected_category_confidence'] = all_clip_results[i]["category_conf"]
                 product['mapped_local_category_id'] = mapped_categories[i]["id"]
@@ -814,10 +938,11 @@ class ProductEnrichmentPipeline:
                 product['mapped_local_gender'] = mapped_genders[i]["name"]
                 product['gender_mapping_confidence'] = mapped_genders[i]["confidence"]
 
-                # BETA: NLP-based category (text only, no images)
-                product['beta_nlp_category_id'] = nlp_categories[i]["id"]
-                product['beta_nlp_category'] = nlp_categories[i]["name"]
-                product['beta_nlp_category_confidence'] = nlp_categories[i]["confidence"]
+                # Zero-shot category classification (BART - most accurate)
+                product['zeroshot_category_id'] = zeroshot_categories[i]["id"]
+                product['zeroshot_category'] = zeroshot_categories[i]["name"]
+                product['zeroshot_category_confidence'] = zeroshot_categories[i]["confidence"]
+                product['suggestion_create_category_name'] = zeroshot_categories[i]["suggestion"]
 
             # Write output
             self.write_csv(products, output_path)
