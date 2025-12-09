@@ -657,287 +657,11 @@ class FashionImageProcessor:
 # =============================================================================
 
 class TaxonomyMapper:
-    """Maps values to local taxonomy using sentence embeddings."""
+    """Maps values to local taxonomy using sentence embeddings.
 
-    # Bidirectional Swedish ↔ English translations for clothing categories
-    # Used to enrich both queries AND category embeddings for better cross-language matching
-    SWEDISH_TO_ENGLISH = {
-        # Outerwear
-        'jackor': 'jackets coats outerwear',
-        'jacka': 'jacket coat outerwear',
-        'kappa': 'coat overcoat',
-        'kappor': 'coats overcoats',
-        'rock': 'coat overcoat',
-        'dunjacka': 'down jacket puffer jacket',
-        'skinnjacka': 'leather jacket',
-        'regnjacka': 'rain jacket raincoat',
-        'vindjacka': 'windbreaker wind jacket',
-        'fleecejacka': 'fleece jacket',
-        'softshell': 'softshell jacket',
-
-        # Pants/Bottoms
-        'byxor': 'pants trousers',
-        'jeans': 'jeans denim',
-        'shorts': 'shorts',
-        'kjolar': 'skirts',
-        'kjol': 'skirt',
-        'chinos': 'chinos khakis',
-        'joggers': 'joggers sweatpants',
-        'mjukisbyxor': 'sweatpants joggers lounge pants',
-        'kostymbyxor': 'dress pants suit pants trousers',
-        'cargobyxor': 'cargo pants',
-
-        # Dresses
-        'klänningar': 'dresses',
-        'klänning': 'dress',
-        'maxiklänning': 'maxi dress',
-        'miniklänning': 'mini dress',
-        'midiklänning': 'midi dress',
-
-        # Tops
-        'toppar': 'tops blouses shirts',
-        'topp': 'top blouse',
-        't-shirts': 't-shirts tees',
-        't-shirt': 't-shirt tee',
-        'tröja': 'sweater pullover jumper',
-        'tröjor': 'sweaters pullovers jumpers knitwear',
-        'skjortor': 'shirts button-up dress shirts',
-        'skjorta': 'shirt button-up',
-        'blus': 'blouse',
-        'blusar': 'blouses',
-        'linne': 'tank top singlet vest',
-        'linnen': 'tank tops singlets',
-        'polotröja': 'polo shirt polo',
-        'sweatshirt': 'sweatshirt crew neck',
-        'sweatshirts': 'sweatshirts hoodies crew necks',
-        'hoodie': 'hoodie hooded sweatshirt',
-        'huvtröja': 'hoodie hooded sweatshirt',
-        'kofta': 'cardigan',
-        'koftor': 'cardigans',
-        'stickad': 'knitted knitwear knit',
-
-        # Suits/Formal
-        'kavajer': 'blazers suit jackets sport coats',
-        'kavaj': 'blazer suit jacket sport coat',
-        'kostymer': 'suits',
-        'kostym': 'suit',
-        'väst': 'vest waistcoat',
-        'västar': 'vests waistcoats',
-
-        # Underwear/Intimates
-        'underkläder': 'underwear lingerie intimates',
-        'trosor': 'panties briefs underwear',
-        'kalsonger': 'boxers briefs underwear mens',
-        'bh': 'bra bras',
-        'sport-bh': 'sports bra athletic bra',
-
-        # Socks/Hosiery
-        'strumpor': 'socks hosiery',
-        'strumpbyxor': 'pantyhose stockings tights hosiery',  # Traditional tights/pantyhose
-        'ankelstrumpor': 'ankle socks',
-        'knästrumpor': 'knee socks knee-high socks',
-
-        # Athletic/Activewear - IMPORTANT: distinguish from pantyhose!
-        'tights': 'athletic tights leggings running tights workout tights sportswear',
-        'leggings': 'leggings athletic tights yoga pants workout pants',
-        'träningsbyxor': 'training pants workout pants athletic pants',
-        'träningskläder': 'activewear sportswear athletic wear workout clothes',
-        'träningströja': 'athletic shirt workout top sports top',
-        'löparkläder': 'running clothes running gear',
-        'yogakläder': 'yoga clothes yoga wear',
-
-        # Footwear
-        'skor': 'shoes footwear',
-        'sneakers': 'sneakers trainers athletic shoes',
-        'stövlar': 'boots',
-        'stövel': 'boot',
-        'stövletter': 'ankle boots booties',
-        'sandaler': 'sandals',
-        'sandal': 'sandal',
-        'klackskor': 'heels high heels pumps',
-        'loafers': 'loafers slip-ons',
-        'ballerina': 'ballet flats flats',
-        'träningsskor': 'athletic shoes training shoes sneakers',
-        'löparskor': 'running shoes',
-        'vandringsskor': 'hiking shoes hiking boots',
-        'tofflor': 'slippers',
-
-        # Bags/Accessories
-        'väskor': 'bags handbags purses',
-        'väska': 'bag handbag purse',
-        'ryggsäck': 'backpack rucksack',
-        'ryggsäckar': 'backpacks rucksacks',
-        'axelväska': 'shoulder bag',
-        'handväska': 'handbag purse',
-        'plånbok': 'wallet',
-        'plånböcker': 'wallets',
-        'accessoarer': 'accessories',
-        'bälten': 'belts',
-        'bälte': 'belt',
-        'halsdukar': 'scarves',
-        'halsduk': 'scarf',
-        'sjal': 'shawl wrap',
-        'mössor': 'hats caps beanies',
-        'mössa': 'hat cap beanie',
-        'keps': 'cap baseball cap',
-        'handskar': 'gloves',
-        'vantar': 'mittens',
-        'solglasögon': 'sunglasses',
-
-        # Swimwear
-        'badkläder': 'swimwear swimsuits bathing suits',
-        'baddräkt': 'swimsuit one-piece',
-        'bikini': 'bikini two-piece',
-        'badbyxor': 'swim trunks swim shorts',
-        'badshorts': 'swim shorts board shorts',
-
-        # Sleepwear
-        'pyjamas': 'pajamas sleepwear pjs',
-        'nattlinne': 'nightgown nightdress',
-        'morgonrock': 'robe bathrobe',
-
-        # Base layers / Thermal underwear
-        'underställ': 'base layer thermal underwear long underwear baselayer merino',
-        'undertröja': 'thermal top base layer top long sleeve underwear',
-        'underbyxa': 'thermal pants base layer pants long underwear bottoms',
-        'långkalsonger': 'long johns thermal pants base layer',
-        'merinoull': 'merino wool thermal base layer',
-        'baslager': 'base layer thermal underwear',
-
-        # Outdoor / Ski wear / Shell clothing
-        'skalbyxor': 'shell pants ski pants waterproof pants outdoor pants skiing trousers hardshell',
-        'skaljacka': 'shell jacket ski jacket waterproof jacket outdoor jacket hardshell',
-        'skalplagg': 'shell garment waterproof outdoor hardshell',
-        'skidbyxor': 'ski pants skiing pants snow pants winter pants',
-        'skidjacka': 'ski jacket skiing jacket snow jacket winter jacket',
-        'skidkläder': 'ski wear skiing clothes ski clothing winter sports',
-        'friluftsbyxor': 'outdoor pants hiking pants trekking pants',
-        'friluftsjacka': 'outdoor jacket hiking jacket trekking jacket',
-        'vandringsjacka': 'hiking jacket trekking jacket outdoor jacket',
-        'vandringsbyxor': 'hiking pants trekking pants outdoor pants',
-        'regnbyxor': 'rain pants waterproof pants',
-        'vindbyxor': 'wind pants windproof pants',
-        'softshellbyxor': 'softshell pants outdoor pants hiking pants',
-        'hardshell': 'hardshell waterproof shell outdoor skiing',
-        'gore-tex': 'gore-tex waterproof breathable outdoor',
-        'vattentät': 'waterproof water-resistant',
-        'andningsförmåga': 'breathable breathability',
-        'freeride': 'freeride skiing backcountry',
-        'topptur': 'ski touring backcountry skiing alpine touring',
-        'alpin': 'alpine skiing downhill',
-
-        # General
-        'kläder': 'clothing apparel clothes',
-        'herr': 'men mens male man',
-        'dam': 'women womens female woman ladies',
-        'barn': 'kids children boys girls',
-        'flicka': 'girl girls',
-        'pojke': 'boy boys',
-        'baby': 'baby infant',
-        'nyfödd': 'newborn baby',
-        'unisex': 'unisex gender-neutral',
-    }
-
-    # English → Swedish (reverse mappings for English supplier data)
-    ENGLISH_TO_SWEDISH = {
-        'jacket': 'jacka jackor',
-        'coat': 'kappa rock',
-        'pants': 'byxor',
-        'trousers': 'byxor kostymbyxor',
-        'jeans': 'jeans',
-        'shorts': 'shorts',
-        'skirt': 'kjol kjolar',
-        'dress': 'klänning klänningar',
-        't-shirt': 't-shirt t-shirts',
-        'tee': 't-shirt',
-        'shirt': 'skjorta skjortor',
-        'blouse': 'blus blusar',
-        'sweater': 'tröja tröjor stickad',
-        'pullover': 'tröja',
-        'jumper': 'tröja',
-        'cardigan': 'kofta koftor',
-        'hoodie': 'hoodie huvtröja',
-        'sweatshirt': 'sweatshirt tröja',
-        'blazer': 'kavaj kavajer',
-        'suit': 'kostym kostymer',
-        'vest': 'väst',
-        'tank top': 'linne',
-        'polo': 'polotröja',
-        'underwear': 'underkläder',
-        'bra': 'bh',
-        'sports bra': 'sport-bh',
-        'panties': 'trosor',
-        'boxers': 'kalsonger',
-        'socks': 'strumpor',
-        'tights': 'tights leggings träningsbyxor',  # Athletic context
-        'leggings': 'leggings tights',
-        'pantyhose': 'strumpbyxor',
-        'stockings': 'strumpbyxor',
-        'activewear': 'träningskläder',
-        'sportswear': 'träningskläder',
-        'athletic': 'träning sport',
-        'shoes': 'skor',
-        'sneakers': 'sneakers träningsskor',
-        'boots': 'stövlar',
-        'sandals': 'sandaler',
-        'heels': 'klackskor',
-        'flats': 'ballerina',
-        'loafers': 'loafers',
-        'bag': 'väska väskor',
-        'backpack': 'ryggsäck',
-        'purse': 'handväska',
-        'wallet': 'plånbok',
-        'belt': 'bälte bälten',
-        'scarf': 'halsduk sjal',
-        'hat': 'mössa keps hatt',
-        'gloves': 'handskar',
-        'swimwear': 'badkläder',
-        'bikini': 'bikini',
-        'pajamas': 'pyjamas',
-        'robe': 'morgonrock',
-        'men': 'herr man',
-        'women': 'dam kvinna',
-        'kids': 'barn',
-        'boys': 'pojke pojkar',
-        'girls': 'flicka flickor',
-        'fleece': 'fleece fleecetröja',
-        'crew': 'sweatshirt tröja',
-        'half zip': 'halv dragkedja',
-        'running': 'löpar löpning',
-        'base layer': 'underställ baslager',
-        'thermal': 'underställ termisk',
-        'long underwear': 'underställ långkalsonger',
-        'merino': 'merinoull merino',
-        'baselayer': 'underställ baslager',
-        # Outdoor / Ski wear
-        'shell pants': 'skalbyxor skidbyxor',
-        'ski pants': 'skidbyxor skalbyxor',
-        'snow pants': 'skidbyxor vinterbyxor',
-        'shell jacket': 'skaljacka skidjacka',
-        'ski jacket': 'skidjacka skaljacka',
-        'outdoor pants': 'friluftsbyxor vandringsbyxor',
-        'hiking pants': 'vandringsbyxor friluftsbyxor',
-        'rain pants': 'regnbyxor',
-        'waterproof': 'vattentät vattenavvisande',
-        'breathable': 'andningsbar',
-        'hardshell': 'hardshell skalplagg',
-        'softshell': 'softshell',
-        'freeride': 'freeride offpist',
-        'alpine': 'alpin',
-        'bib pants': 'hängselbyxor skalbyxor',
-        'bib': 'hängslen hängselbyxor',
-    }
-
-    # Gender term mappings (common variations → database values)
-    GENDER_ALIASES = {
-        'male': 'man men mens',
-        'female': 'woman women womens',
-        'men': 'man male mens',
-        'women': 'woman female womens',
-        'herr': 'man male men',
-        'dam': 'woman female women',
-        'unisex': 'unisex',
-    }
+    Swedish-only matching with gender filtering.
+    Categories are filtered by product gender before matching.
+    """
 
     def __init__(self, config: Config):
         self.config = config
@@ -950,40 +674,16 @@ class TaxonomyMapper:
         self.local_categories = []
         self.local_genders = []
 
-        # Load bilingual dictionary for word-level translations
+        # Categories grouped by gender_id for fast filtering
+        self.categories_by_gender = {}  # gender_id -> list of category indices
+        self.category_embeddings_by_gender = {}  # gender_id -> embeddings tensor
+
+        # Load WikiDict dictionary for word-level translations
         self.dictionary = get_dictionary()
         self.dictionary.load()
 
-        # Load neural translator for any language → English
+        # Load neural translator for sentence-level translations
         self.translator = get_translator()
-
-    def _add_bilingual_aliases(self, text: str) -> str:
-        """Add translations in both directions (Swedish↔English) for better matching.
-
-        Uses both:
-        1. Hardcoded fashion-specific translations (fast, domain-specific)
-        2. WikiDict dictionary for general vocabulary (~70K words each direction)
-        """
-        result = text
-        lower_text = text.lower()
-
-        # 1. Add fashion-specific translations (hardcoded, high quality for fashion)
-        for swedish, english in self.SWEDISH_TO_ENGLISH.items():
-            if swedish in lower_text:
-                result = f"{result} {english}"
-
-        for english, swedish in self.ENGLISH_TO_SWEDISH.items():
-            if english in lower_text:
-                result = f"{result} {swedish}"
-
-        # 2. Add dictionary translations for remaining words
-        result = self.dictionary.enrich_text(result)
-
-        return result
-
-    def _add_english_aliases(self, swedish_text: str) -> str:
-        """Add English translations to Swedish category text (legacy, uses bilingual now)."""
-        return self._add_bilingual_aliases(swedish_text)
 
     def set_local_colors(self, colors: list[dict]):
         self.local_colors = colors
@@ -991,27 +691,43 @@ class TaxonomyMapper:
         self.color_embeddings = self.model.encode(names, convert_to_tensor=True, show_progress_bar=False)
 
     def set_local_categories(self, categories: list[dict]):
+        """Set categories and group by gender for filtered matching."""
         self.local_categories = categories
+
+        # Group categories by gender_id
+        self.categories_by_gender = {}
+        for i, c in enumerate(categories):
+            gender_id = c.get("gender_id")
+            if gender_id not in self.categories_by_gender:
+                self.categories_by_gender[gender_id] = []
+            self.categories_by_gender[gender_id].append(i)
+
+        # Create embeddings - Swedish only, use dictionary for translations
         texts = []
         for c in categories:
+            # Use path (e.g., "Kläder > Jackor > Dunjackor") or just name
             text = c.get("path", c["name"]) or c["name"]
-            if c.get("gender_name"):
-                text = f"{c['gender_name']} {text}"
-            # Add English translations for Swedish terms
-            text = self._add_english_aliases(text)
+            # Enrich with dictionary translations
+            text = self.dictionary.enrich_text(text)
             texts.append(text)
+
         logger.info(f"Category embedding examples: {texts[:3]}")
+        logger.info(f"Categories by gender: {[(gid, len(idxs)) for gid, idxs in self.categories_by_gender.items()]}")
         self.category_embeddings = self.model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
 
+        # Pre-compute embeddings per gender for fast filtering
+        for gender_id, indices in self.categories_by_gender.items():
+            self.category_embeddings_by_gender[gender_id] = self.category_embeddings[indices]
+
     def set_local_genders(self, genders: list[dict]):
+        """Set genders and create lookup."""
         self.local_genders = genders
-        # Enrich gender names with common aliases
-        texts = []
-        for g in genders:
-            name = g["name"]
-            aliases = self.GENDER_ALIASES.get(name.lower(), '')
-            text = f"{name} {aliases}".strip()
-            texts.append(text)
+        self.gender_lookup = {g["name"].lower(): g for g in genders}
+        # Also create id lookup
+        self.gender_id_lookup = {g["id"]: g for g in genders}
+
+        # Simple embeddings - just the name
+        texts = [g["name"] for g in genders]
         logger.info(f"Gender embeddings: {texts}")
         self.gender_embeddings = self.model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
 
@@ -1081,137 +797,91 @@ class TaxonomyMapper:
                 })
         return results
 
-    def map_batch_categories(self, detected: list[str], product_types: list[str],
-                              google_categories: list[str] = None, detected_confidences: list[float] = None,
-                              titles: list[str] = None, descriptions: list[str] = None) -> list[dict]:
+    def map_batch_categories(self, product_types: list[str], titles: list[str],
+                              descriptions: list[str], gender_ids: list[int]) -> list[dict]:
         """
-        Map batch of categories to local taxonomy.
-        Priority: product_type > description keywords > title keywords > detected from image > google_category
+        Map batch of categories to local taxonomy with GENDER FILTERING.
+
+        Swedish-only matching. Categories are filtered by product gender before matching.
+        Uses WikiDict dictionary for translations, no hardcoded translations.
 
         Returns dict with: id, name, confidence, suggested_category
-        - If confidence >= threshold: returns matched local category, suggested_category = None
-        - If confidence < threshold: returns "unknown" + AI-generated suggested_category
         """
         if not self.local_categories:
-            return [{"id": None, "name": None, "confidence": 0.0, "suggested_category": None} for _ in detected]
+            return [{"id": None, "name": None, "confidence": 0.0, "suggested_category": None} for _ in product_types]
 
-        if google_categories is None:
-            google_categories = [''] * len(detected)
-        if detected_confidences is None:
-            detected_confidences = [1.0] * len(detected)
-        if titles is None:
-            titles = [''] * len(detected)
-        if descriptions is None:
-            descriptions = [''] * len(detected)
-
-        # Minimum confidence to use image detection
-        MIN_DETECTION_CONFIDENCE = 0.15
-
-        # Build query with priority: product_type > description keywords > title > detected > google
+        # Build queries from Swedish text - use dictionary for enrichment
         queries = []
-        for d, p, g, conf, title, desc in zip(detected, product_types, google_categories, detected_confidences, titles, descriptions):
+        for p, title, desc in zip(product_types, titles, descriptions):
             parts = []
 
-            # 1. Product type is usually most specific (e.g., "Half zip sweater", "Jacket", "T-shirt")
+            # 1. Product type (e.g., "Pants", "Jacket", "Tröja")
             if p:
                 parts.append(p)
-                p_lower = p.lower()
-                # Add English aliases for Swedish terms (e.g., "Tröja" → "sweater")
-                for keyword, aliases in self.SWEDISH_TO_ENGLISH.items():
-                    if keyword in p_lower:
-                        parts.append(aliases)
-                # Add Swedish aliases for English terms (e.g., "Dress" → "klänning")
-                for keyword, aliases in self.ENGLISH_TO_SWEDISH.items():
-                    if keyword in p_lower:
-                        parts.append(aliases)
 
-            # 2. Description often contains key category info (e.g., "underställ", "klänning")
-            if desc:
-                desc_lower = desc.lower()
-                # Look for category keywords in description
-                for keyword, aliases in self.SWEDISH_TO_ENGLISH.items():
-                    if keyword in desc_lower:
-                        parts.append(keyword)  # Add Swedish term
-                        parts.append(aliases)  # Add English translations
-                for keyword, aliases in self.ENGLISH_TO_SWEDISH.items():
-                    if keyword in desc_lower:
-                        parts.append(keyword)
-                        parts.append(aliases)
-
-            # 3. Title often contains product keywords (e.g., "M's Tree Message Tee" → "Tee")
+            # 2. Title keywords (e.g., "Houdini M's Ride Pants" → extract "Pants")
             if title:
-                # Extract last word which often indicates product type
-                title_words = title.split()
-                if title_words:
-                    # Common product keywords at end of title
-                    last_word = title_words[-1].rstrip(',').lower()
-                    product_keywords = ['jacket', 'coat', 'tee', 't-shirt', 'shirt', 'pants', 'jeans',
-                                       'shorts', 'dress', 'skirt', 'sweater', 'hoodie', 'top', 'blouse',
-                                       'crew', 'fleece', 'vest', 'cardigan', 'polo']
-                    if last_word in product_keywords:
-                        parts.append(last_word)
-                        # Also add translations for the keyword
-                        if last_word in self.ENGLISH_TO_SWEDISH:
-                            parts.append(self.ENGLISH_TO_SWEDISH[last_word])
+                parts.append(title)
 
-            # 4. SKIP image detection - unreliable (wrong images from suppliers)
-            # 5. SKIP Google category - often WRONG (e.g., "Jackets" for pants)
-            # Only use: product_type, description, title
+            # 3. Description (Swedish text, e.g., "skalbyxor", "polotröja")
+            if desc:
+                # Take first 100 chars of description for key terms
+                parts.append(desc[:100])
 
-            # Build final query and enrich with dictionary
+            # Build query and enrich with dictionary translations
             query = ' '.join(parts) if parts else 'unknown'
-            query = self._add_bilingual_aliases(query)
+            query = self.dictionary.enrich_text(query)
             queries.append(query)
 
-        # Process in batches to avoid GPU OOM (N products x 830 categories = huge!)
+        # Process with gender filtering
         BATCH_SIZE = 256
         results = []
-        result_idx = 0  # Track position in original arrays
-
-        # Move category embeddings to CPU once
-        cat_cpu = self.category_embeddings.cpu()
 
         for i in range(0, len(queries), BATCH_SIZE):
             batch_queries = queries[i:i + BATCH_SIZE]
-            batch_size_actual = len(batch_queries)
+            batch_gender_ids = gender_ids[i:i + BATCH_SIZE]
+            batch_product_types = product_types[i:i + BATCH_SIZE]
+            batch_titles = titles[i:i + BATCH_SIZE]
 
-            # Encode batch on GPU, then move to CPU for similarity
+            # Encode queries
             query_emb = self.model.encode(batch_queries, convert_to_tensor=True, show_progress_bar=False)
-            query_cpu = query_emb.cpu()
 
-            # Compute similarity on CPU to avoid GPU OOM
-            sims = torch.nn.functional.cosine_similarity(query_cpu.unsqueeze(1), cat_cpu.unsqueeze(0), dim=2)
-            best_idx = sims.argmax(dim=1)
-            best_scores = sims.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+            # Process each product with its gender filter
+            for j, (q_emb, gender_id, pt, title) in enumerate(zip(query_emb, batch_gender_ids, batch_product_types, batch_titles)):
+                # Get categories for this gender
+                if gender_id in self.categories_by_gender:
+                    cat_indices = self.categories_by_gender[gender_id]
+                    cat_emb = self.category_embeddings_by_gender[gender_id]
+                else:
+                    # Fallback to all categories if gender not found
+                    cat_indices = list(range(len(self.local_categories)))
+                    cat_emb = self.category_embeddings
 
-            # Build results for this batch
-            for j, (idx, score) in enumerate(zip(best_idx, best_scores)):
-                conf = round(score.item(), 3)
-                orig_idx = result_idx + j  # Position in original input arrays
+                # Compute similarity
+                sims = torch.nn.functional.cosine_similarity(q_emb.unsqueeze(0), cat_emb, dim=1)
+                best_local_idx = sims.argmax().item()
+                best_score = sims[best_local_idx].item()
+                conf = round(best_score, 3)
+
+                # Map back to original category index
+                best_idx = cat_indices[best_local_idx]
 
                 if conf >= self.config.min_mapping_confidence:
                     results.append({
-                        "id": self.local_categories[idx.item()]["id"],
-                        "name": self.local_categories[idx.item()]["name"],
+                        "id": self.local_categories[best_idx]["id"],
+                        "name": self.local_categories[best_idx]["name"],
                         "confidence": conf,
-                        "suggested_category": None  # Good match, no suggestion needed
+                        "suggested_category": None
                     })
                 else:
-                    # Low confidence - generate smart suggestion
-                    suggestion = self.generate_category_suggestion(
-                        detected_category=detected[orig_idx] if orig_idx < len(detected) else '',
-                        product_type=product_types[orig_idx] if orig_idx < len(product_types) else '',
-                        title=titles[orig_idx] if orig_idx < len(titles) else '',
-                        google_category=google_categories[orig_idx] if orig_idx < len(google_categories) else ''
-                    )
+                    # Low confidence - suggest based on product type
+                    suggestion = pt if pt else (title.split()[-1] if title else "unknown")
                     results.append({
                         "id": None,
                         "name": "unknown",
                         "confidence": conf,
                         "suggested_category": suggestion
                     })
-
-            result_idx += batch_size_actual
 
         return results
 
@@ -1954,15 +1624,20 @@ class ProductEnrichmentPipeline:
 
         return clip_results
 
-    def _process_text_categories(self, product_types: list[str], google_categories: list[str],
-                                  titles: list[str], descriptions: list[str],
+    def _process_text_categories(self, product_types: list[str], titles: list[str],
+                                  descriptions: list[str], csv_genders: list[str],
                                   size_contexts: list[dict], item_group_ids: list[str]) -> tuple[list[dict], list[dict]]:
-        """Process categories using TEXT only (no images).
+        """Process categories using TEXT only with GENDER FILTERING.
 
         OPTIMIZATION: Deduplicates by item_group_id - variants of same product share category.
         Returns (mapped_categories, llm_categories) for ALL products.
         """
         total_products = len(product_types)
+
+        # First, map genders to get gender_ids for filtering
+        logger.info("Mapping genders for category filtering...")
+        mapped_genders = self.mapper.map_batch_genders(csv_genders)
+        gender_ids = [g["id"] for g in mapped_genders]
 
         # =====================================================================
         # DEDUPLICATION: Group by item_group_id, process only unique groups
@@ -1983,20 +1658,15 @@ class ProductEnrichmentPipeline:
 
         # Extract data for unique products only
         unique_product_types = [product_types[i] for i in unique_indices]
-        unique_google_cats = [google_categories[i] for i in unique_indices]
         unique_titles = [titles[i] for i in unique_indices]
         unique_descriptions = [descriptions[i] for i in unique_indices]
+        unique_gender_ids = [gender_ids[i] for i in unique_indices]
         unique_contexts = [size_contexts[i] for i in unique_indices]
 
-        # Dummy detected values since we don't use images for categories anymore
-        dummy_detected = [''] * num_unique
-        dummy_confidences = [0.0] * num_unique
-
-        # Embedding-based category matching (TEXT only) - on UNIQUE products only
-        logger.info(f"Running text-based category embeddings on {num_unique} unique groups...")
+        # Embedding-based category matching with gender filtering
+        logger.info(f"Running text-based category embeddings on {num_unique} unique groups (with gender filter)...")
         unique_mapped = self.mapper.map_batch_categories(
-            dummy_detected, unique_product_types, unique_google_cats, dummy_confidences,
-            unique_titles, unique_descriptions
+            unique_product_types, unique_titles, unique_descriptions, unique_gender_ids
         )
 
         # LLM for low-confidence matches - on UNIQUE products only
@@ -2057,7 +1727,6 @@ class ProductEnrichmentPipeline:
             csv_colors = [p.get('color', '') for p in products]
             csv_genders = [p.get('gender', '') for p in products]
             product_types = [p.get('product_type', '') for p in products]
-            google_categories = [p.get('google_product_category', '') for p in products]
             titles = [p.get('title', '') for p in products]
             descriptions = [p.get('description', '') for p in products]
             item_group_ids = [p.get('item_group_id', '') for p in products]  # For deduplication
@@ -2089,7 +1758,7 @@ class ProductEnrichmentPipeline:
             category_task = asyncio.create_task(
                 asyncio.to_thread(
                     self._process_text_categories,
-                    product_types, google_categories, titles, descriptions, size_contexts, item_group_ids
+                    product_types, titles, descriptions, csv_genders, size_contexts, item_group_ids
                 )
             )
 
