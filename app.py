@@ -96,9 +96,20 @@ class Config:
     ])
 
     size_type_labels: list = field(default_factory=lambda: [
-        "jeans/pants", "shirt/top", "dress", "shoes", "socks",
-        "underwear", "jacket/coat", "accessories", "swimwear", "one-size",
-        "leggings/tights", "skirt"
+        "jeans/pants/trousers",
+        "t-shirt/shirt/top/blouse",
+        "sweater/fleece/hoodie/crew",
+        "jacket/coat/outerwear",
+        "dress",
+        "skirt",
+        "shorts",
+        "shoes/boots/sneakers",
+        "socks",
+        "underwear/lingerie",
+        "swimwear/bikini",
+        "accessories/belt/hat/scarf",
+        "leggings/tights",
+        "one-size"
     ])
 
     # Minimum confidence to consider a mapping valid (otherwise return "unknown")
@@ -258,16 +269,24 @@ class FashionImageProcessor:
         # Pre-compute text embeddings for colors and categories
         self._precompute_embeddings()
 
+    def set_local_colors(self, local_colors: list[dict]):
+        """Set local colors from database - CLIP will detect these exact colors."""
+        self.local_color_names = [c["name"] for c in local_colors]
+        self.local_color_ids = [c["id"] for c in local_colors]
+
+        # Create embeddings for LOCAL colors
+        color_texts = [f"{c} colored clothing" for c in self.local_color_names]
+        with torch.no_grad():
+            color_tokens = self.tokenizer(color_texts).to(self.device)
+            self.color_embeddings = self.model.encode_text(color_tokens, normalize=True)
+            if self.config.use_fp16:
+                self.color_embeddings = self.color_embeddings.half()
+
+        logger.info(f"FashionSigLIP: Using {len(self.local_color_names)} LOCAL colors: {self.local_color_names[:10]}...")
+
     @torch.no_grad()
     def _precompute_embeddings(self):
-        """Pre-compute all text embeddings once for fast inference."""
-        # Color prompts - fashion-specific phrasing
-        color_texts = [f"{c} colored clothing" for c in self.config.color_prompts]
-        color_tokens = self.tokenizer(color_texts).to(self.device)
-        self.color_embeddings = self.model.encode_text(color_tokens, normalize=True)
-        if self.config.use_fp16:
-            self.color_embeddings = self.color_embeddings.half()
-
+        """Pre-compute category embeddings (colors are set from database later)."""
         # Category prompts - fashion-specific phrasing
         category_texts = [f"a {c}" for c in self.config.category_prompts]
         category_tokens = self.tokenizer(category_texts).to(self.device)
@@ -275,7 +294,16 @@ class FashionImageProcessor:
         if self.config.use_fp16:
             self.category_embeddings = self.category_embeddings.half()
 
-        logger.info(f"Pre-computed embeddings for {len(self.config.color_prompts)} colors, {len(self.config.category_prompts)} categories")
+        # Initialize with config colors as fallback (will be replaced by local colors)
+        self.local_color_names = self.config.color_prompts
+        self.local_color_ids = [None] * len(self.config.color_prompts)
+        color_texts = [f"{c} colored clothing" for c in self.local_color_names]
+        color_tokens = self.tokenizer(color_texts).to(self.device)
+        self.color_embeddings = self.model.encode_text(color_tokens, normalize=True)
+        if self.config.use_fp16:
+            self.color_embeddings = self.color_embeddings.half()
+
+        logger.info(f"Pre-computed embeddings for {len(self.config.category_prompts)} categories")
 
     def _preprocess_worker(self, img: Image.Image) -> torch.Tensor:
         """Preprocess single image (for parallel execution)."""
@@ -312,11 +340,13 @@ class FashionImageProcessor:
         color_probs, color_idx = color_sims.max(dim=-1)
         category_probs, category_idx = category_sims.max(dim=-1)
 
-        # Build results
-        results = [{"color": None, "category": None, "color_conf": 0.0, "category_conf": 0.0} for _ in images]
+        # Build results - use LOCAL colors from database
+        results = [{"color": None, "color_id": None, "category": None, "color_conf": 0.0, "category_conf": 0.0} for _ in images]
         for i, valid_idx in enumerate(valid_indices):
+            cidx = color_idx[i].item()
             results[valid_idx] = {
-                "color": self.config.color_prompts[color_idx[i].item()],
+                "color": self.local_color_names[cidx],
+                "color_id": self.local_color_ids[cidx],
                 "category": self.config.category_prompts[category_idx[i].item()],
                 "color_conf": round(color_probs[i].item(), 3),
                 "category_conf": round(category_probs[i].item(), 3)
@@ -348,6 +378,7 @@ class TaxonomyMapper:
         'kostymer': 'suits',
         'underkläder': 'underwear lingerie',
         'strumpor': 'socks hosiery',
+        'strumpbyxor': 'pantyhose stockings hosiery',  # NOT athletic tights!
         'skor': 'shoes footwear',
         'sneakers': 'sneakers trainers',
         'stövlar': 'boots',
@@ -359,7 +390,7 @@ class TaxonomyMapper:
         'mössor': 'hats caps beanies',
         'handskar': 'gloves',
         'badkläder': 'swimwear bikinis',
-        'träningskläder': 'activewear sportswear',
+        'träningskläder': 'activewear sportswear tights leggings',
         'pyjamas': 'pajamas sleepwear',
         'kläder': 'clothing apparel',
         'herr': 'men mens male',
@@ -367,8 +398,8 @@ class TaxonomyMapper:
         'barn': 'kids children',
         'man': 'men mens male man',
         'woman': 'women womens female woman',
-        'tights': 'tights leggings',
-        'kjolar': 'skirts',
+        'tights': 'athletic tights leggings running pants sportswear',  # NOT pantyhose!
+        'leggings': 'leggings tights athletic pants',
         'kjol': 'skirt',
     }
 
@@ -527,6 +558,11 @@ class TaxonomyMapper:
             # 1. Product type is usually most specific (e.g., "Half zip sweater", "Jacket", "T-shirt")
             if p:
                 parts.append(p)
+                # Add English aliases to help matching (e.g., "Tights" → "athletic tights leggings")
+                p_lower = p.lower()
+                for keyword, aliases in self.SWEDISH_TO_ENGLISH.items():
+                    if keyword in p_lower:
+                        parts.append(aliases)
 
             # 2. Title often contains product keywords (e.g., "M's Tree Message Tee" → "Tee")
             if title:
@@ -872,6 +908,7 @@ class ProductEnrichmentPipeline:
         # Initialize models
         logger.info("Loading FashionSigLIP model...")
         self.fashion = FashionImageProcessor(self.config)
+        self.fashion.set_local_colors(colors)  # Use YOUR database colors for detection!
 
         logger.info("Loading Sentence Transformer...")
         self.mapper = TaxonomyMapper(self.config)
@@ -1014,7 +1051,9 @@ class ProductEnrichmentPipeline:
             logger.info("Classification tasks complete!")
 
             # Extract detected values with confidence scores
+            # CLIP now detects directly into YOUR local colors!
             detected_colors = [r["color"] for r in all_clip_results]
+            detected_color_ids = [r["color_id"] for r in all_clip_results]
             detected_color_confidences = [r["color_conf"] for r in all_clip_results]
             detected_categories = [r["category"] for r in all_clip_results]
             detected_category_confidences = [r["category_conf"] for r in all_clip_results]
@@ -1035,9 +1074,11 @@ class ProductEnrichmentPipeline:
             # Enrich products
             logger.info("Enriching products...")
             for i, product in enumerate(products):
-                # Color - maps supplier color to local color, suggests new if no match
+                # Color - CLIP now detects directly into YOUR local colors!
                 product['detected_color'] = detected_colors[i]
-                product['detected_color_confidence'] = all_clip_results[i]["color_conf"]
+                product['detected_color_id'] = detected_color_ids[i]  # Direct from CLIP using your colors
+                product['detected_color_confidence'] = detected_color_confidences[i]
+                # Also keep sentence-similarity mapping for comparison
                 product['mapped_local_color_id'] = mapped_colors[i]["id"]
                 product['mapped_local_color'] = mapped_colors[i]["name"]
                 product['color_mapping_confidence'] = mapped_colors[i]["confidence"]
